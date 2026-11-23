@@ -58,6 +58,7 @@ const defaultSettings = Object.freeze({
     pricesVersion: PRICES_VERSION,
     entries: [],
     unpriced: [],
+    originRules: [],
 });
 
 const ctx = () => SillyTavern.getContext();
@@ -326,7 +327,10 @@ function stackFrames(stack) {
         const bi = /\/scripts\/extensions\/([^/]+)\//.exec(line);
         if (bi && bi[1] !== 'third-party') { out.push({ bi: bi[1] }); continue; }
         const core = /https?:\/\/[^/\s]+(\/[^:?#\s)]+\.m?js)/.exec(line);
-        if (core) out.push({ core: core[1] });
+        if (core) {
+            const fn = /^\s*at (?:async )?([\w$.]+)/.exec(line)?.[1] || /^\s*([\w$.]+)@/.exec(line)?.[1] || '';
+            out.push({ core: core[1], fn: fn.split('.').pop() });
+        }
     }
     return out;
 }
@@ -361,6 +365,7 @@ function callerFromStack() {
         // Ran out of frames: everything but the last folder of the run is a wrapper.
         for (const f of run.slice(0, -1)) fetchWrappers.add(f);
     }
+    const route = frames.slice(i).filter(f => f.core && f.fn).slice(0, 5).map(f => f.fn).join('>');
     let viaSlash = false;
     for (let k = i; k < frames.length; k++) {
         const fr = frames[k];
@@ -369,12 +374,12 @@ function callerFromStack() {
             if (fr.patch) continue;
             // A wrapper is skipped only where it wraps; deeper down it may be a real caller.
             if (k < j && fetchWrappers.has(fr.tp)) continue;
-            return { kind: 'third', folder: fr.tp };
+            return { kind: 'third', folder: fr.tp, route };
         }
-        if (fr.bi && BUILTIN_EXT[fr.bi] !== null) return { kind: 'builtin', label: BUILTIN_EXT[fr.bi] || fr.bi };
+        if (fr.bi && BUILTIN_EXT[fr.bi] !== null) return { kind: 'builtin', label: BUILTIN_EXT[fr.bi] || fr.bi, route };
         if (fr.core && /\/scripts\/slash-commands/.test(fr.core)) viaSlash = true;
     }
-    return viaSlash ? { kind: 'slash' } : null;
+    return { kind: viaSlash ? 'slash' : 'none', route };
 }
 
 function captureOrigin() {
@@ -395,15 +400,154 @@ function captureOrigin() {
     if (caller?.kind === 'third') { ext = caller.folder; extDisplayName(caller.folder); }
     else if (caller?.kind === 'builtin') ext = `@${caller.label}`;
     else if (caller?.kind === 'slash') ext = '@슬래시 명령 / 퀵 리플라이';
-    return { chat: String(chat).slice(0, 60), chatId: chatId.slice(0, 120), gen, ext, genRef: g };
+    return { chat: String(chat).slice(0, 60), chatId: chatId.slice(0, 120), gen, ext, genRef: g, route: caller?.route || '' };
 }
 
 function extLabel(e) {
     if (!e.ext && !e.gen) return '(이전 기록)';
     if (!e.ext) return ['normal', 'swipe', 'regenerate', 'continue', 'impersonate'].includes(e.gen) ? '직접 채팅' : '알 수 없음';
-    if (e.ext.startsWith('@')) return e.ext.slice(1);
+    const mark = e.extBy === 'rule' ? ' (학습)' : '';
+    if (e.ext.startsWith('@')) return e.ext.slice(1) + mark;
     if (extNames[e.ext] === undefined) extDisplayName(e.ext);
-    return extNames[e.ext] || e.ext;
+    return (extNames[e.ext] || e.ext) + mark;
+}
+
+// ------------------------------------------------------------ learning "who sent it"
+//
+// When the caller can't be found, the user can name it. We then remember a
+// fingerprint of that request — hashes of its first and last message (an
+// extension's own prompt text), its token limit, model and the ST functions it
+// went through — and label look-alike requests the same way from then on.
+// Only short hashes are kept, never the text itself.
+
+function hashText(s) {
+    let h = 0x811c9dc5;
+    const str = String(s);
+    for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+    return (h >>> 0).toString(36);
+}
+
+function msgText(m) {
+    if (typeof m?.content === 'string') return m.content;
+    if (Array.isArray(m?.content)) return m.content.map(p => p?.text || '').join('\n');
+    return '';
+}
+
+function fingerprint(body, route) {
+    const msgs = Array.isArray(body.messages) ? body.messages : [];
+    const head = msgs.length ? `${msgs[0].role}:${msgText(msgs[0]).slice(0, 300)}` : '';
+    const last = msgs.length > 1 ? msgs[msgs.length - 1] : null;
+    const tail = last ? `${last.role}:${msgText(last).slice(0, 300)}` : '';
+    return {
+        h: head ? hashText(head) : '',
+        t: tail ? hashText(tail) : '',
+        mt: Number(body.max_tokens ?? body.max_completion_tokens) || 0,
+        r: String(route || '').slice(0, 200),
+    };
+}
+
+/** How well a learned rule fits a request (0 = not at all). */
+function ruleScore(rule, gen, model, fp) {
+    if (!fp || rule.gen !== gen) return 0;
+    if (rule.r && fp.r && rule.r !== fp.r) return 0;
+    let s = 0;
+    if (rule.t && rule.t === fp.t) s += 3;
+    if (rule.h && rule.h === fp.h) s += 2;
+    if (rule.mt && rule.mt === fp.mt) s += 1;
+    if (rule.model && rule.model === model) s += 1;
+    return s >= 3 ? s : 0;
+}
+
+function findRule(gen, model, fp) {
+    let best = null;
+    let bestScore = 0;
+    for (const rule of S.originRules) {
+        const sc = ruleScore(rule, gen, model, fp);
+        if (sc > bestScore || (sc && sc === bestScore && rule.at > best.at)) { best = rule; bestScore = sc; }
+    }
+    return best;
+}
+
+/** Labels unknown-sender entries (new or old) from the learned rules. */
+function applyRules(entries) {
+    let n = 0;
+    for (const e of entries) {
+        if (!e.fp || (e.ext && e.extBy !== 'rule')) continue;
+        const rule = findRule(e.gen, e.model, e.fp);
+        const ext = rule ? rule.ext : '';
+        if (rule && e.ext !== ext) { e.ext = ext; e.extBy = 'rule'; n++; }
+        else if (!rule && e.extBy === 'rule') { e.ext = ''; delete e.extBy; n++; }
+    }
+    return n;
+}
+
+async function installedExtensions() {
+    const list = [];
+    try {
+        const res = await fetch('/api/extensions/discover', { headers: ctx().getRequestHeaders() });
+        const found = res.ok ? await res.json() : [];
+        for (const x of Array.isArray(found) ? found : []) {
+            const name = String(x?.name || '');
+            if (!name.startsWith('third-party/')) continue;
+            const folder = name.slice('third-party/'.length);
+            if (PASS_THROUGH.has(folder)) continue;
+            list.push({ value: folder, label: await extDisplayName(folder) });
+        }
+    } catch { /* fall back to built-ins only */ }
+    list.sort((a, b) => a.label.localeCompare(b.label, 'ko'));
+    for (const label of new Set(Object.values(BUILTIN_EXT).filter(Boolean))) list.push({ value: `@${label}`, label: `${label} (기본 확장)` });
+    list.push({ value: '@슬래시 명령 / 퀵 리플라이', label: '슬래시 명령 / 퀵 리플라이' });
+    return list;
+}
+
+/** Lets the user say which extension sent a request, and learn from it. */
+async function labelEntry(e) {
+    const { Popup, POPUP_TYPE } = ctx();
+    const exts = await installedExtensions();
+    const sel = el('select', { class: 'text_pole' },
+        el('option', { value: '', text: '— 고르세요 —' }),
+        ...exts.map(x => el('option', { value: x.value, text: x.label, selected: e.ext === x.value })),
+        el('option', { value: '@@custom', text: '직접 입력…' }),
+        el('option', { value: '@@clear', text: '(지정 취소 — 알 수 없음으로)' }));
+    const custom = el('input', { class: 'text_pole', type: 'text', placeholder: '이름 (예: 내 QR 스크립트)', hidden: true });
+    sel.addEventListener('change', () => { custom.hidden = sel.value !== '@@custom'; });
+    const learn = el('input', { type: 'checkbox', checked: !!e.fp });
+    if (!e.fp) learn.disabled = true;
+    const box = el('div', { class: 'cl-root', style: 'text-align:left' },
+        el('h3', { text: '이 요청은 어느 확장이 보냈나요?' }),
+        el('div', { class: 'cl-note', text: `${new Date(e.t).toLocaleString()} · ${e.model} · 입력 ${fmtTok(e.in)} / 출력 ${fmtTok(e.out)} · ${GEN_TYPES[e.gen] || ''}` }),
+        sel, custom,
+        el('label', { class: 'checkbox_label' }, learn, document.createTextNode(' 비슷한 요청도 앞으로 이 확장으로 표시 (학습)')),
+        el('div', { class: 'cl-note', text: e.fp
+            ? '같은 확장은 보통 매번 비슷한 지시문을 보내요. 그 지시문의 지문(짧은 해시)만 저장해서 다음부터 알아봐요. 내용 자체는 저장하지 않아요.'
+            : '업데이트 전 기록이라 지문이 없어서 이 줄만 바꿔요. 학습은 새 기록부터 돼요.' }));
+    const ok = await new Popup(box, POPUP_TYPE.CONFIRM, '', { okButton: '저장', cancelButton: '취소' }).show();
+    if (!ok) return;
+    let ext = sel.value;
+    if (ext === '@@custom') {
+        const name = custom.value.trim().slice(0, 40);
+        if (!name) { toastr.warning('이름을 입력해주세요.'); return; }
+        ext = `@${name}`;
+    }
+    if (!ext) return;
+    if (ext === '@@clear') {
+        e.ext = ''; delete e.extBy;
+        if (e.fp) S.originRules = S.originRules.filter(r => !(r.gen === e.gen && r.h === e.fp.h && r.t === e.fp.t && (r.r || '') === (e.fp.r || '')));
+    } else {
+        e.ext = ext;
+        e.extBy = 'user';
+        if (ext.startsWith('@') === false) extDisplayName(ext);
+        if (e.fp && learn.checked) {
+            const same = S.originRules.find(r => r.gen === e.gen && r.h === e.fp.h && r.t === e.fp.t && (r.r || '') === (e.fp.r || ''));
+            if (same) { same.ext = ext; same.at = Date.now(); same.model = e.model; same.mt = e.fp.mt; }
+            else S.originRules.push({ id: uid(), ext, gen: e.gen, model: e.model, ...e.fp, at: Date.now(), hits: 0 });
+            if (S.originRules.length > 100) S.originRules.splice(0, S.originRules.length - 100);
+        }
+    }
+    const n = applyRules(S.entries);
+    save();
+    renderAll();
+    if (n) toastr.info(`비슷한 이전 기록 ${n}건도 같이 바꿨어요.`, '💳 크레딧 장부');
 }
 
 function originText(e, opts = S) {
@@ -505,7 +649,9 @@ function inspectRequest(input, init) {
     let origin = {};
     try { probeWrappers(); } catch { /* */ }
     try { origin = captureOrigin(); } catch { /* never block a request */ }
-    return { source, model: String(body.model || ''), host, viaProxy, keyId, origin, stream: !!body.stream, messages: body.messages, t: Date.now() };
+    let fp = null;
+    try { fp = fingerprint(body, origin.route); } catch { /* */ }
+    return { source, model: String(body.model || ''), host, viaProxy, keyId, origin, fp, stream: !!body.stream, messages: body.messages, t: Date.now() };
 }
 
 function readGeminiUsage(o) {
@@ -660,6 +806,11 @@ function record(meta, usage, estimated) {
         costSrc: lookup ? 'pending' : (tokenCost === null ? 'unpriced' : 'tokens'),
         tokenCost,
     };
+    if (meta.fp) entry.fp = meta.fp;
+    if (!entry.ext && meta.fp) {
+        const rule = findRule(entry.gen, entry.model, meta.fp);
+        if (rule) { entry.ext = rule.ext; entry.extBy = 'rule'; rule.hits = (rule.hits || 0) + 1; rule.last = now; }
+    }
     if (w && !lookup && tokenCost !== null) {
         entry.cost = chargeTokens(w, tokenCost, now);
         if (entry.est) w.estApprox = (w.estApprox || 0) + 1;
@@ -1108,6 +1259,7 @@ function renderDiag() {
     box.replaceChildren(
         el('div', { class: 'cl-note', text: '자동 보정은 이렇게 동작해요: 지갑의 "잔액 보정"에 콘솔에서 본 실제 잔액을 넣으면, 지난 보정 이후 장부가 계산한 금액과 실제로 줄어든 금액을 비교해요. 차이만큼 다음 계산에 배율을 곱해요. 보정할수록 정확해지고, 충전·최근 사용·너무 큰 차이처럼 믿기 어려운 경우는 자동으로 건너뛰어요.' }),
     );
+    box.append(renderRules());
     if (S.unpriced.length) box.append(el('div', { class: 'cl-note cl-warn-text', text: `⚠️ 단가표에 없는 모델: ${S.unpriced.join(', ')} → "단가표" 탭에서 추가하면 계산돼요.` }));
     const priced = S.wallets.filter(w => !TYPES[w.type]?.lookup);
     if (!priced.length) { box.append(el('div', { class: 'cl-note', text: '단가로 계산하는 지갑(Vertex·AI Studio·기타)이 없어요.' })); return; }
@@ -1654,6 +1806,33 @@ function renderOriginSummary() {
         el('div', { class: 'cl-note', text: `최근 ${MAX_ENTRIES}건 기록 기준이에요. "보낸 곳"은 요청을 보낸 코드를 거슬러 찾은 거라, 다른 확장을 거쳐 부르면 중간 확장 이름이 나올 수 있어요.` }));
 }
 
+function isUnknown(e) {
+    return !e.ext && !!e.gen && !['normal', 'swipe', 'regenerate', 'continue', 'impersonate'].includes(e.gen);
+}
+
+function renderRules() {
+    const card = el('div', { class: 'cl-card' }, el('b', { text: '학습한 사용처' }));
+    if (!S.originRules.length) {
+        card.append(el('div', { class: 'cl-note', text: '아직 없어요. "사용 기록" 탭에서 "누구? ✎"를 눌러 보낸 확장을 지정하면, 비슷한 요청을 다음부터 알아서 표시해요.' }));
+        return card;
+    }
+    const tbl = el('table', { class: 'cl-table' },
+        el('tr', {}, ...['확장', '종류', '모델', '맞힌 횟수', ''].map(h => el('th', { text: h }))));
+    for (const r of [...S.originRules].reverse()) {
+        tbl.append(el('tr', {},
+            el('td', { text: extLabel({ ext: r.ext, gen: r.gen }) }),
+            el('td', { text: GEN_TYPES[r.gen] || r.gen }),
+            el('td', { text: r.model || '', class: 'cl-model' }),
+            el('td', { text: String(r.hits || 0) }),
+            el('td', {}, el('button', {
+                class: 'menu_button cl-mini', text: '✕', title: '이 학습 지우기',
+                onclick: () => { S.originRules = S.originRules.filter(x => x !== r); applyRules(S.entries); save(); renderAll(); },
+            }))));
+    }
+    card.append(tbl, el('div', { class: 'cl-note', text: '지우면 이 학습으로 붙인 이름도 "알 수 없음"으로 돌아가요. 잘못 붙은 기록은 사용 기록에서 ✎로 바로 고칠 수 있어요.' }));
+    return card;
+}
+
 function renderLog() {
     const box = document.getElementById('cl_log');
     if (!box) return;
@@ -1676,7 +1855,13 @@ function renderLog() {
         tbl.append(el('tr', {},
             el('td', { text: time }),
             el('td', {}, w ? document.createTextNode(w.name) : el('span', { class: 'cl-warn-text', text: e.host ? maskHost(e.host) : e.src }), addBtn),
-            el('td', { text: originText(e, { ...S, showModel: false }) || '—' }),
+            el('td', {}, document.createTextNode(originText(e, { ...S, showModel: false }) || '—'), ' ',
+                el('button', {
+                    class: `menu_button cl-mini${isUnknown(e) ? ' cl-who' : ''}`,
+                    text: isUnknown(e) ? '누구? ✎' : '✎',
+                    title: '보낸 확장 지정하기',
+                    onclick: () => labelEntry(e),
+                })),
             el('td', { text: e.model, class: 'cl-model' }),
             el('td', { text: tok }),
             el('td', { text: entryCostText(e, w) })));

@@ -67,3 +67,5 @@
 .toast.cl-bank-toast { background-color: #1f6f5c !important; }
 .toast.cl-bank-toast .toast-title { font-weight: bold; }
 .cl-root [hidden] { display: none !important; }
+.cl-root .cl-who { color: var(--warning, #e8a33d); border-color: var(--warning, #e8a33d); }
+.cl-root .cl-table .cl-mini { white-space: nowrap; width: auto; display: inline-block; margin: 2px 0 0; }
