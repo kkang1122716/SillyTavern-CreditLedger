@@ -253,6 +253,7 @@ async function extDisplayName(folder) {
         if (m?.display_name) extNames[folder] = String(m.display_name).slice(0, 40);
     } catch { /* keep folder name */ }
     renderLog();
+    renderWho();
     return extNames[folder];
 }
 
@@ -1030,6 +1031,7 @@ const WINDOW_HTML = `
   <button class="menu_button cl-tab" data-tab="wallets">지갑</button>
   <button class="menu_button cl-tab" data-tab="links">연결 관리</button>
   <button class="menu_button cl-tab" data-tab="log">사용 기록</button>
+  <button class="menu_button cl-tab" data-tab="who">보낸 곳 찾기<span class="cl-who-count"></span></button>
   <button class="menu_button cl-tab" data-tab="prices">단가표</button>
   <button class="menu_button cl-tab" data-tab="diag">진단·설정</button>
 </div>
@@ -1048,6 +1050,9 @@ const WINDOW_HTML = `
 </section>
 <section data-pane="log" hidden>
   <div id="cl_log"></div>
+</section>
+<section data-pane="who" hidden>
+  <div id="cl_who"></div>
 </section>
 <section data-pane="prices" hidden>
   <div class="cl-note">1백만 토큰당 가격(달러)이에요. 모델 이름은 앞부분만 맞으면 돼요 (예: <code>gemini-3.1-pro</code>는 <code>gemini-3.1-pro-preview</code>에도 적용). "20만↑"은 입력이 20만 토큰을 넘을 때 가격, "시작/끝"은 프로모션처럼 기간이 정해진 가격이에요(비우면 항상). 기본값은 커뮤니티에서 정리한 참고값이에요.</div>
@@ -1259,7 +1264,6 @@ function renderDiag() {
     box.replaceChildren(
         el('div', { class: 'cl-note', text: '자동 보정은 이렇게 동작해요: 지갑의 "잔액 보정"에 콘솔에서 본 실제 잔액을 넣으면, 지난 보정 이후 장부가 계산한 금액과 실제로 줄어든 금액을 비교해요. 차이만큼 다음 계산에 배율을 곱해요. 보정할수록 정확해지고, 충전·최근 사용·너무 큰 차이처럼 믿기 어려운 경우는 자동으로 건너뛰어요.' }),
     );
-    box.append(renderRules());
     if (S.unpriced.length) box.append(el('div', { class: 'cl-note cl-warn-text', text: `⚠️ 단가표에 없는 모델: ${S.unpriced.join(', ')} → "단가표" 탭에서 추가하면 계산돼요.` }));
     const priced = S.wallets.filter(w => !TYPES[w.type]?.lookup);
     if (!priced.length) { box.append(el('div', { class: 'cl-note', text: '단가로 계산하는 지갑(Vertex·AI Studio·기타)이 없어요.' })); return; }
@@ -1813,7 +1817,7 @@ function isUnknown(e) {
 function renderRules() {
     const card = el('div', { class: 'cl-card' }, el('b', { text: '학습한 사용처' }));
     if (!S.originRules.length) {
-        card.append(el('div', { class: 'cl-note', text: '아직 없어요. "사용 기록" 탭에서 "누구? ✎"를 눌러 보낸 확장을 지정하면, 비슷한 요청을 다음부터 알아서 표시해요.' }));
+        card.append(el('div', { class: 'cl-note', text: '아직 없어요. 위에서 "누구? ✎"를 눌러 보낸 확장을 지정하면 여기에 쌓여요.' }));
         return card;
     }
     const tbl = el('table', { class: 'cl-table' },
@@ -1831,6 +1835,35 @@ function renderRules() {
     }
     card.append(tbl, el('div', { class: 'cl-note', text: '지우면 이 학습으로 붙인 이름도 "알 수 없음"으로 돌아가요. 잘못 붙은 기록은 사용 기록에서 ✎로 바로 고칠 수 있어요.' }));
     return card;
+}
+
+function renderWho() {
+    const unknown = S.entries.filter(isUnknown);
+    document.querySelectorAll('.cl-who-count').forEach(b => { b.textContent = unknown.length ? ` (${unknown.length})` : ''; });
+    const box = document.getElementById('cl_who');
+    if (!box) return;
+    box.replaceChildren(el('div', { class: 'cl-note', text: '보낸 확장을 찾지 못한 기록이에요. "누구?"를 눌러 그때 쓴 확장을 고르면, 비슷한 요청은 다음부터 알아서 그 확장으로 표시해요. 요청 내용은 저장하지 않고 짧은 지문만 기억해요.' }));
+    const card = el('div', { class: 'cl-card' }, el('b', { text: `이름이 필요한 기록 ${unknown.length}건` }));
+    if (!unknown.length) card.append(el('div', { class: 'cl-note', text: '지금은 없어요 👍' }));
+    else {
+        const tbl = el('table', { class: 'cl-table' },
+            el('tr', {}, ...['시간', '채팅', '모델', '입력/출력', '비용', ''].map(h => el('th', { text: h }))));
+        for (const e of unknown.slice(-60).reverse()) {
+            const w = S.wallets.find(x => x.id === e.w);
+            const d = new Date(e.t);
+            const time = (dayKey(e.t) === dayKey() ? '' : `${d.getMonth() + 1}/${d.getDate()} `) + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            tbl.append(el('tr', {},
+                el('td', { text: time }),
+                el('td', { text: e.chat || '—' }),
+                el('td', { text: e.model, class: 'cl-model' }),
+                el('td', { text: `${fmtTok(e.in)} / ${fmtTok(e.out + (e.think || 0))}${e.est ? ' ≈' : ''}` }),
+                el('td', { text: entryCostText(e, w) }),
+                el('td', {}, el('button', { class: 'menu_button cl-mini cl-who', text: '누구? ✎', onclick: () => labelEntry(e) }))));
+        }
+        card.append(tbl);
+        if (unknown.some(e => !e.fp)) card.append(el('div', { class: 'cl-note', text: '1.0.9 전에 쌓인 기록은 지문이 없어서 그 줄 이름만 바뀌고 학습은 안 돼요.' }));
+    }
+    box.append(card, renderRules());
 }
 
 function renderLog() {
@@ -1919,6 +1952,7 @@ function renderAll() {
         renderPluginStatus();
         renderWallets();
         renderLog();
+        renderWho();
         renderDiag();
     } catch (e) {
         console.warn('[credit-ledger] render failed', e);
