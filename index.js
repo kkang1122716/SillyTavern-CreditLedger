@@ -95,8 +95,17 @@ function timeAgo(t) {
 
 // ------------------------------------------------------------ wallets
 
+function aliasHosts(w) {
+    return (Array.isArray(w.aliases) ? w.aliases : []).map(hostOf).filter(Boolean);
+}
+
 function walletFor(meta) {
     const host = meta.host;
+    // Extra addresses the user tied to a wallet win over everything else,
+    // e.g. a personal Cloudflare Worker that relays to the same Vertex account.
+    if (host) {
+        for (const w of S.wallets) if (aliasHosts(w).includes(host)) return w;
+    }
     for (const w of S.wallets) {
         if (w.type === 'newapi' || w.type === 'manual') {
             if (host && hostOf(w.url) === host) return w;
@@ -122,10 +131,10 @@ function remainingOf(w) {
     return { value: w.base.amount - (w.spentSinceBase || 0), kind: 'est' };
 }
 
-function addDaily(w, cost) {
+function addDaily(w, cost, t = Date.now()) {
     if (!Number.isFinite(cost) || cost <= 0) return;
     w.daily = w.daily || {};
-    const k = dayKey();
+    const k = dayKey(t);
     w.daily[k] = (w.daily[k] || 0) + cost;
     const keys = Object.keys(w.daily).sort();
     while (keys.length > DAILY_KEEP_DAYS) delete w.daily[keys.shift()];
@@ -545,6 +554,7 @@ function renderWallets() {
         if (rem.kind === 'real') sub.push(`조회 ${timeAgo(rem.at)}`);
         if (rem.kind === 'est') sub.push('추정치');
         if (w.real?.unlimited && Number.isFinite(w.real.used)) sub.push(`누적 사용 ${fmt(w.real.used, unit)}`);
+        if (aliasHosts(w).length) sub.push(`묶인 주소 ${aliasHosts(w).length}개`);
         if (w.lastDelta) sub.push(`최근 변동 ${fmt(w.lastDelta.amount, unit)}${w.lastDelta.calls > 1 ? ` (${w.lastDelta.calls}회)` : ''}`);
 
         const card = el('div', { class: 'cl-card' },
@@ -594,8 +604,9 @@ function currentConnection() {
     const o = ctx().chatCompletionSettings || {};
     const source = String(o.chat_completion_source || '');
     const viaProxy = !!o.reverse_proxy;
-    if (source === 'custom') return { type: 'newapi', url: o.custom_url || '', source };
-    if (viaProxy) return { type: 'newapi', url: o.reverse_proxy, source, proxy: true };
+    const relay = (u) => /\.workers\.dev$/i.test(hostOf(u)) || /\.pages\.dev$/i.test(hostOf(u));
+    if (source === 'custom') return { type: relay(o.custom_url) ? 'manual' : 'newapi', url: o.custom_url || '', source };
+    if (viaProxy) return { type: relay(o.reverse_proxy) ? 'manual' : 'newapi', url: o.reverse_proxy, source, proxy: true };
     if (source === 'vertexai') return { type: 'vertex', source };
     if (source === 'makersuite') return { type: 'gemini', source };
     if (source === 'deepseek') return { type: 'deepseek', source };
@@ -631,6 +642,8 @@ async function openEditor(existing, preset) {
     const startBal = el('input', { class: 'text_pole', type: 'number', step: 'any', value: existing?.base?.amount ?? '', placeholder: '예: 287.40' });
     const unit = el('input', { class: 'text_pole cl-unit', value: w.unit || '', placeholder: '$' });
     const auto = el('input', { type: 'checkbox', checked: w.auto !== false });
+    const aliases = el('textarea', { class: 'text_pole', rows: '2', placeholder: 'https://내워커.workers.dev/v1' });
+    aliases.value = (w.aliases || []).join('\n');
 
     function fillKeys() {
         keySel.replaceChildren(el('option', { value: '', text: '— 키를 골라주세요 —' }));
@@ -655,6 +668,9 @@ async function openEditor(existing, preset) {
     const rowDs = el('label', { class: 'cl-field' }, el('span', { text: 'DeepSeek 키' }), dsSel);
     const rowBal = el('label', { class: 'cl-field' }, el('span', { text: '지금 남은 잔액 (콘솔에서 확인한 값)' }), el('div', { class: 'cl-row' }, startBal, unit));
     const rowAuto = el('label', { class: 'checkbox_label' }, auto, el('span', { text: '답장 후 자동으로 잔액 조회 (같은 지갑은 1분에 최대 1번)' }));
+    const rowAlias = el('label', { class: 'cl-field' },
+        el('span', { text: '같은 계정으로 계산할 다른 주소 (한 줄에 하나, 선택)' }), aliases,
+        el('small', { text: '예: 같은 Vertex 계정으로 연결된 내 클라우드플레어 워커 주소. 이 주소로 보낸 요청도 이 지갑에서 빠져요. 주소는 이 실리태번 설정 안에만 저장돼요.' }));
     const noPlugin = el('div', { class: 'cl-note cl-warn-text', text: pluginOk ? (sourcesErr ? `키 목록을 못 읽었어요: ${sourcesErr}` : '') : '서버 플러그인이 없으면 이 종류는 실제 잔액 조회가 안 돼요. 기록과 토큰 수는 남아요.' });
 
     function sync() {
@@ -679,7 +695,12 @@ async function openEditor(existing, preset) {
                 url: url.value.trim(),
                 unit: unit.value.trim(),
                 auto: auto.checked,
+                aliases: aliases.value.split(/\s+/).map(s => s.trim()).filter(Boolean),
             };
+            const badAlias = out.aliases.find(a => !hostOf(a));
+            if (badAlias) { toastr.warning(`주소 형식을 확인해주세요: ${badAlias.slice(0, 40)}`); return; }
+            const taken = S.wallets.find(x => x.id !== out.id && aliasHosts(x).some(h => aliasHosts(out).includes(h)));
+            if (taken) { toastr.warning(`그 주소는 이미 "${taken.name}" 지갑에 묶여 있어요.`); return; }
             if ((t === 'newapi' || t === 'manual') && !hostOf(out.url)) { toastr.warning('API 주소를 확인해주세요.'); return; }
             if (t === 'newapi') {
                 const v = keySel.value;
@@ -700,6 +721,18 @@ async function openEditor(existing, preset) {
             }
             const i = S.wallets.findIndex(x => x.id === out.id);
             if (i >= 0) S.wallets[i] = out; else S.wallets.push(out);
+            // Past unassigned requests to a newly tied address now belong here.
+            const hosts = aliasHosts(out);
+            for (const e of S.entries) {
+                if (e.w || !e.host || !hosts.includes(e.host)) continue;
+                e.w = out.id;
+                if (!TYPES[t].lookup && Number.isFinite(e.tokenCost)) {
+                    e.cost = e.tokenCost;
+                    e.costSrc = 'tokens';
+                    if (!out.base || e.t >= out.base.at) out.spentSinceBase = (out.spentSinceBase || 0) + e.tokenCost;
+                    addDaily(out, e.tokenCost, e.t);
+                }
+            }
             const dupe = S.wallets.find(x => x.id !== out.id && x.type === out.type && (TYPES[t].source ? true : hostOf(x.url) === hostOf(out.url)));
             if (dupe) toastr.info(`"${dupe.name}"과 같은 연결이라, 기록은 먼저 만든 지갑으로 들어가요.`);
             box.hidden = true;
@@ -714,7 +747,7 @@ async function openEditor(existing, preset) {
         el('b', { text: existing ? '지갑 편집' : '새 지갑' }),
         el('label', { class: 'cl-field' }, el('span', { text: '이름' }), name),
         el('label', { class: 'cl-field' }, el('span', { text: '종류' }), type),
-        rowUrl, rowKey, rowDs, rowBal, rowAuto, noPlugin,
+        rowUrl, rowKey, rowDs, rowBal, rowAuto, rowAlias, noPlugin,
         el('div', { class: 'cl-row' }, saveBtn, cancel),
     );
     box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
