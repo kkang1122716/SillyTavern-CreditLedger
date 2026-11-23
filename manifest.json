@@ -1,0 +1,14 @@
+{
+    "display_name": "Credit Ledger (크레딧 장부)",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "dependencies": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "kkang1122716",
+    "version": "1.0.0",
+    "homePage": "https://github.com/kkang1122716/SillyTavern-CreditLedger",
+    "auto_update": false,
+    "minimum_client_version": "1.13.0"
+}

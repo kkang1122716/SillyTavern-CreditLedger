@@ -1,0 +1,41 @@
+#cl_chip {
+    font-size: 0.8em;
+    opacity: 0.8;
+    padding: 2px 10px;
+    cursor: pointer;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    user-select: none;
+}
+#cl_chip:hover { opacity: 1; }
+#cl_chip.cl-warn { color: var(--warning, #e8a33d); }
+
+.cl-root .cl-card {
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 8px;
+    padding: 8px 10px;
+    margin: 6px 0;
+}
+.cl-root .cl-card-head { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.cl-root .cl-type { font-size: 0.8em; opacity: 0.7; }
+.cl-root .cl-big { font-size: 1.4em; font-weight: bold; margin: 4px 0 2px; }
+.cl-root .cl-sub { font-size: 0.85em; opacity: 0.8; }
+.cl-root .cl-note { font-size: 0.85em; opacity: 0.8; margin: 4px 0; }
+.cl-root .cl-warn-text { color: var(--warning, #e8a33d); opacity: 1; }
+.cl-root .cl-row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-top: 6px; }
+.cl-root .cl-row .menu_button { width: auto; padding: 4px 10px; margin: 0; }
+.cl-root .cl-mini { padding: 1px 6px !important; font-size: 0.8em; }
+.cl-root .cl-editor { border: 1px dashed var(--SmartThemeBorderColor); border-radius: 8px; padding: 8px 10px; margin: 8px 0; }
+.cl-root .cl-field { display: flex; flex-direction: column; gap: 2px; margin: 6px 0; }
+.cl-root .cl-field > span { font-size: 0.85em; opacity: 0.85; }
+.cl-root .cl-field small { opacity: 0.7; }
+.cl-root .cl-unit { max-width: 5em; }
+.cl-root .cl-section { margin: 8px 0; }
+.cl-root .cl-section summary { cursor: pointer; font-weight: bold; }
+.cl-root .cl-table { width: 100%; border-collapse: collapse; font-size: 0.8em; margin-top: 4px; }
+.cl-root .cl-table th, .cl-root .cl-table td { padding: 3px 4px; border-bottom: 1px solid var(--SmartThemeBorderColor); text-align: left; vertical-align: top; }
+.cl-root .cl-model { word-break: break-all; }
+.cl-root .cl-prices input { min-width: 0; width: 100%; padding: 2px 4px; margin: 0; }
+.cl-root .cl-prices td:first-child { min-width: 9em; }
+.cl-root [hidden] { display: none !important; }
