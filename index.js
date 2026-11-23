@@ -258,6 +258,31 @@ async function extDisplayName(folder) {
 // Extensions seen wrapping window.fetch (retry, logging…). They sit between
 // the real caller and our hook on every request, so they are never "the caller".
 const fetchWrappers = new Set();
+const PROBE_URL = '/__credit-ledger-wrapper-probe__';
+let hookFn = null;
+let probedFetch = null;
+
+/**
+ * Finds exactly which extensions sit on top of our fetch hook: we send a fake
+ * request through window.fetch, our hook answers it locally (nothing leaves the
+ * browser), and every extension frame between the top and our hook is a wrapper.
+ * Re-run whenever window.fetch changes (some extensions re-wrap themselves later).
+ */
+function probeWrappers() {
+    if (!hookFn || window.fetch === probedFetch) return;
+    probedFetch = window.fetch;
+    if (window.fetch === hookFn) return;
+    try { window.fetch(PROBE_URL).catch(() => {}); } catch { /* */ }
+}
+
+function learnWrappersFromProbe(stack) {
+    const frames = stackFrames(stack);
+    let i = 0;
+    while (i < frames.length && frames[i].self) i++;
+    for (; i < frames.length && !frames[i].self; i++) {
+        if (frames[i].tp) fetchWrappers.add(frames[i].tp);
+    }
+}
 
 /** Splits a stack into frames: { tp: folder } / { bi: folder } / { core: path } / null. */
 function stackFrames(stack) {
@@ -291,6 +316,7 @@ function callerFromStack() {
         Error.stackTraceLimit = old;
     }
     const frames = stackFrames(stack);
+    if (window.__creditLedgerDebug) (window.__creditLedgerStacks ||= []).push({ stack, wrappers: [...fetchWrappers] });
     // Drop our own frames at the top.
     let i = 0;
     while (i < frames.length && frames[i].self) i++;
@@ -450,6 +476,7 @@ function inspectRequest(input, init) {
     const slot = viaProxy ? '' : keySlotFor(body);
     const keyId = slot ? (body.secret_id || activeKeys[slot] || '') : '';
     let origin = {};
+    try { probeWrappers(); } catch { /* */ }
     try { origin = captureOrigin(); } catch { /* never block a request */ }
     return { source, model: String(body.model || ''), host, viaProxy, keyId, origin, stream: !!body.stream, messages: body.messages, t: Date.now() };
 }
@@ -626,7 +653,17 @@ function installFetchHook() {
     if (window.__creditLedgerHooked) return;
     window.__creditLedgerHooked = true;
     const orig = window.fetch;
-    window.fetch = function (input, init) {
+    hookFn = window.fetch = function (input, init) {
+        if (input === PROBE_URL) {
+            try {
+                const old = Error.stackTraceLimit;
+                Error.stackTraceLimit = 80;
+                const stack = String(new Error().stack || '');
+                Error.stackTraceLimit = old;
+                learnWrappersFromProbe(stack);
+            } catch { /* */ }
+            return Promise.resolve(new Response('', { status: 204 }));
+        }
         let meta = null;
         try { meta = inspectRequest(input, init); } catch { meta = null; }
         const p = orig.apply(this, arguments);
@@ -1715,6 +1752,7 @@ function mountPanel() {
         eventSource.on(event_types.APP_READY, start);
         refreshActiveKeys().then(() => renderAll());
         eventSource.on(event_types.APP_READY, refreshActiveKeys);
+        eventSource.on(event_types.APP_READY, () => setTimeout(probeWrappers, 3000));
         eventSource.on(event_types.GENERATION_STARTED, onGenStarted);
         for (const ev of ['GENERATION_ENDED', 'GENERATION_STOPPED']) if (event_types[ev]) eventSource.on(event_types[ev], onGenEnded);
         for (const ev of ['SECRET_WRITTEN', 'SECRET_DELETED', 'SECRET_ROTATED', 'SECRET_EDITED']) {
