@@ -492,6 +492,7 @@ const PANEL_HTML = `
       <div class="cl-row">
         <button id="cl_add" class="menu_button">＋ 지갑 추가</button>
         <button id="cl_add_current" class="menu_button">＋ 지금 연결된 API로 추가</button>
+        <button id="cl_import" class="menu_button">＋ 연결 프로필에서 한 번에 가져오기</button>
       </div>
       <div id="cl_editor" class="cl-editor" hidden></div>
       <details class="cl-section">
@@ -613,6 +614,165 @@ function currentConnection() {
     return { type: 'manual', url: '', source };
 }
 
+const isRelay = (u) => /\.(workers|pages)\.dev$/i.test(hostOf(u));
+const SRC_ALIAS = { google: 'makersuite', oai: 'openai' };
+const SRC_TYPE = { vertexai: 'vertex', makersuite: 'gemini', deepseek: 'deepseek' };
+
+/** Moves unassigned past records that belong to wallet w into it. */
+function claimEntries(w) {
+    const hosts = aliasHosts(w);
+    const own = (w.type === 'newapi' || w.type === 'manual') ? hostOf(w.url) : '';
+    const src = TYPES[w.type]?.source;
+    const lookup = TYPES[w.type]?.lookup;
+    let n = 0;
+    for (const e of S.entries) {
+        if (e.w) continue;
+        const hit = (e.host && (hosts.includes(e.host) || e.host === own)) || (src && !e.host && e.src === src);
+        if (!hit) continue;
+        e.w = w.id;
+        n++;
+        if (!lookup && Number.isFinite(e.tokenCost)) {
+            e.cost = e.tokenCost;
+            e.costSrc = 'tokens';
+            if (!w.base || e.t >= w.base.at) w.spentSinceBase = (w.spentSinceBase || 0) + e.tokenCost;
+            addDaily(w, e.tokenCost, e.t);
+        }
+    }
+    return n;
+}
+
+async function proxyHostsByName() {
+    const map = {};
+    try {
+        const s = await loadSources(true);
+        for (const p of s.proxies || []) map[p.name] = p.host;
+        return { map, sources: s };
+    } catch { /* plugin missing */ }
+    try {
+        const mod = await import('../../../openai.js');
+        for (const p of mod.proxies || []) if (p?.name && p.url) map[p.name] = hostOf(p.url);
+    } catch { /* layout changed */ }
+    return { map, sources: null };
+}
+
+async function openImport() {
+    const box = document.getElementById('cl_editor');
+    if (!box) return;
+    const profiles = (ctx().extensionSettings.connectionManager?.profiles || []).filter(p => p && p.mode !== 'tc' && p.api);
+    box.hidden = false;
+    box.replaceChildren();
+    if (!profiles.length) {
+        box.append(el('div', { class: 'cl-note', text: '채팅 완성(Chat Completion) 연결 프로필이 없어요. 실리태번 API 연결 화면의 "연결 프로필"에서 먼저 저장해주세요.' }),
+            el('button', { class: 'menu_button', text: '닫기', onclick: () => { box.hidden = true; } }));
+        return;
+    }
+    const { map: proxyHost, sources } = await proxyHostsByName();
+    const keyLabel = (id) => (sources?.custom || []).concat(sources?.deepseek || []).find(k => k.id === id);
+    const seen = new Set();
+
+    const rows = profiles.map(p => {
+        const source = SRC_ALIAS[p.api] || p.api;
+        const proxyName = p.proxy && p.proxy !== 'None' ? p.proxy : '';
+        let host = '';
+        let url = '';
+        if (source === 'custom') { url = p['api-url'] || ''; host = hostOf(url); }
+        else if (proxyName && proxyHost[proxyName]) { host = proxyHost[proxyName]; url = `https://${host}`; }
+        const viaProxy = !!proxyName;
+        const k = host || source;
+        const existing = walletFor({ source, host, viaProxy });
+        const opts = [['skip', '가져오지 않기']];
+        if (host) {
+            opts.push(['new:newapi', '새 지갑: 프록시 (잔액 조회)'], ['new:manual', '새 지갑: 기타 (단가로 계산)'],
+                ['join:vertex', 'Vertex 지갑에 묶기 (같은 Vertex 계정)'], ['join:gemini', 'AI Studio 지갑에 묶기 (같은 구글 키)']);
+            for (const w of S.wallets) if (!TYPES[w.type].lookup && w.type !== 'vertex' && w.type !== 'gemini') opts.push([`join:${w.id}`, `"${w.name}" 지갑에 묶기`]);
+        } else if (SRC_TYPE[source]) {
+            opts.push([`new:${SRC_TYPE[source]}`, `새 지갑: ${TYPES[SRC_TYPE[source]].label}`]);
+        }
+        let def = 'skip';
+        let note = '';
+        if (existing) note = `이미 "${existing.name}" 지갑에 들어가요`;
+        else if (seen.has(k)) note = '위 프로필과 같은 연결이에요';
+        else if (!host && proxyName) note = '프록시 프리셋 주소를 못 찾았어요';
+        else if (host) def = isRelay(url) ? 'join:vertex' : 'new:newapi';
+        else if (SRC_TYPE[source]) def = `new:${SRC_TYPE[source]}`;
+        else note = `${source}는 아직 지원하지 않아요`;
+        if (!existing) seen.add(k);
+        let keyRef = null;
+        if (source === 'custom') {
+            const sid = p['secret-id'] || ((sources?.custom || []).length === 1 ? sources.custom[0].id : '');
+            if (sid) keyRef = { slot: 'custom', id: sid };
+        } else if (proxyName) keyRef = { slot: 'proxy', name: proxyName };
+        const desc = [source, host || '', keyRef?.slot === 'custom' ? `키: ${keyLabel(keyRef.id)?.label || '이름 모름'}` : proxyName ? `프록시: ${proxyName}` : '', p.model || ''].filter(Boolean).join(' · ');
+        const sel = el('select', { class: 'text_pole' }, ...opts.map(([v, t]) => el('option', { value: v, text: t, selected: v === def })));
+        return { p, source, host, url, keyRef, sel, desc, note };
+    });
+
+    const list = el('div', { class: 'cl-import' });
+    for (const r of rows) {
+        list.append(el('div', { class: 'cl-import-row' },
+            el('div', {}, el('b', { text: r.p.name || '(이름 없음)' }), el('div', { class: 'cl-sub', text: r.desc }),
+                r.note ? el('div', { class: 'cl-sub cl-warn-text', text: r.note }) : null),
+            r.sel));
+    }
+
+    const apply = el('button', {
+        class: 'menu_button', text: '선택한 대로 추가', onclick: () => {
+            const created = [];
+            const findOrMake = (type) => {
+                let w = S.wallets.find(x => x.type === type);
+                if (!w) {
+                    w = { id: uid(), name: type === 'vertex' ? 'Vertex' : 'AI Studio', type, url: '', unit: '$', auto: true, aliases: [] };
+                    S.wallets.push(w);
+                    created.push(w);
+                }
+                return w;
+            };
+            let joined = 0;
+            for (const r of rows) {
+                const v = r.sel.value;
+                if (v === 'skip') continue;
+                if (v.startsWith('new:')) {
+                    const type = v.slice(4);
+                    if (TYPES[type].source && S.wallets.some(x => x.type === type)) continue;
+                    if (!TYPES[type].source && S.wallets.some(x => hostOf(x.url) === r.host || aliasHosts(x).includes(r.host))) continue;
+                    const w = { id: uid(), name: r.p.name || TYPES[type].label, type, url: TYPES[type].source ? '' : r.url, unit: TYPES[type].lookup ? '' : '$', auto: true, aliases: [] };
+                    if (type === 'newapi') w.keyRef = r.keyRef;
+                    if (type === 'deepseek') w.secretId = r.p['secret-id'] || '';
+                    S.wallets.push(w);
+                    created.push(w);
+                } else if (v.startsWith('join:')) {
+                    const target = v.slice(5);
+                    const w = (target === 'vertex' || target === 'gemini') ? findOrMake(target) : S.wallets.find(x => x.id === target);
+                    if (!w || S.wallets.some(x => aliasHosts(x).includes(r.host))) continue;
+                    w.aliases = [...(w.aliases || []), r.url];
+                    joined++;
+                }
+            }
+            let moved = 0;
+            for (const w of S.wallets) moved += claimEntries(w);
+            box.hidden = true;
+            save();
+            renderAll();
+            toastr.success(`지갑 ${created.length}개 추가, 주소 ${joined}개 묶음${moved ? `, 예전 기록 ${moved}건 정리` : ''}.`, '크레딧 장부');
+            if (created.some(w => !TYPES[w.type].lookup)) toastr.info('Vertex/AI Studio/기타 지갑은 "잔액 보정"으로 지금 남은 금액을 넣어주세요.', '크레딧 장부');
+            if (pluginOk) {
+                (async () => {
+                    for (const w of created) {
+                        if (w.type === 'deepseek' || (w.type === 'newapi' && w.keyRef)) await refreshBalance(w.id, false);
+                    }
+                })();
+            }
+        },
+    });
+    box.append(
+        el('b', { text: '연결 프로필에서 가져오기' }),
+        el('div', { class: 'cl-note', text: '프로필마다 어떻게 할지 골라주세요. 내 클라우드플레어 워커처럼 전달만 하는 주소는 "Vertex 지갑에 묶기"를 고르면 돼요. 키 값은 읽지 않고 이름만 봐요.' }),
+        list,
+        el('div', { class: 'cl-row' }, apply, el('button', { class: 'menu_button', text: '취소', onclick: () => { box.hidden = true; } })),
+    );
+    box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
 async function openEditor(existing, preset) {
     const box = document.getElementById('cl_editor');
     if (!box) return;
@@ -721,18 +881,8 @@ async function openEditor(existing, preset) {
             }
             const i = S.wallets.findIndex(x => x.id === out.id);
             if (i >= 0) S.wallets[i] = out; else S.wallets.push(out);
-            // Past unassigned requests to a newly tied address now belong here.
-            const hosts = aliasHosts(out);
-            for (const e of S.entries) {
-                if (e.w || !e.host || !hosts.includes(e.host)) continue;
-                e.w = out.id;
-                if (!TYPES[t].lookup && Number.isFinite(e.tokenCost)) {
-                    e.cost = e.tokenCost;
-                    e.costSrc = 'tokens';
-                    if (!out.base || e.t >= out.base.at) out.spentSinceBase = (out.spentSinceBase || 0) + e.tokenCost;
-                    addDaily(out, e.tokenCost, e.t);
-                }
-            }
+            // Past unassigned requests that belong here now get counted.
+            claimEntries(out);
             const dupe = S.wallets.find(x => x.id !== out.id && x.type === out.type && (TYPES[t].source ? true : hostOf(x.url) === hostOf(out.url)));
             if (dupe) toastr.info(`"${dupe.name}"과 같은 연결이라, 기록은 먼저 만든 지갑으로 들어가요.`);
             box.hidden = true;
@@ -826,6 +976,7 @@ function mountPanel() {
     host.insertAdjacentHTML('beforeend', PANEL_HTML);
     document.getElementById('cl_add').addEventListener('click', () => openEditor(null));
     document.getElementById('cl_add_current').addEventListener('click', () => openEditor(null, currentConnection()));
+    document.getElementById('cl_import').addEventListener('click', () => openImport());
     document.getElementById('cl_price_add').addEventListener('click', () => { S.prices.push({ model: '', in: 0, out: 0 }); save(); renderPrices(); });
     document.getElementById('cl_price_reset').addEventListener('click', async () => {
         if (!await ctx().Popup.show.confirm('단가표 초기화', '기본 단가표로 되돌릴까요? 직접 넣은 값은 사라져요.')) return;

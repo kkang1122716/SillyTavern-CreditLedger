@@ -38,4 +38,6 @@
 .cl-root .cl-model { word-break: break-all; }
 .cl-root .cl-prices input { min-width: 0; width: 100%; padding: 2px 4px; margin: 0; }
 .cl-root .cl-prices td:first-child { min-width: 9em; }
+.cl-root .cl-import-row { display: flex; flex-direction: column; gap: 4px; padding: 6px 0; border-bottom: 1px solid var(--SmartThemeBorderColor); }
+.cl-root .cl-import-row select { margin: 0; }
 .cl-root [hidden] { display: none !important; }
