@@ -284,6 +284,29 @@ function learnWrappersFromProbe(stack) {
     }
 }
 
+// ST functions that send (or lead to) a generation request. Extensions sometimes
+// replace them with a wrapper; such a wrapper shows up in the stack under this name.
+const CORE_REQUEST_FNS = new Set(['fetch', 'sendRequest', 'processRequest', 'generateRaw', 'generateQuietPrompt', 'Generate', 'callback', 'sendOpenAIRequest']);
+
+function isPatchedCoreFn(line) {
+    const s = line.trim();
+    let name = '';
+    let member = false;
+    const v8 = /^at (?:async )?(.+?) \(/.exec(s);
+    if (v8) {
+        const as = /\[as ([\w$]+)\]$/.exec(v8[1]);
+        const full = v8[1].replace(/\s*\[as [\w$]+\]$/, '');
+        member = full.includes('.');
+        name = as ? as[1] : full.split('.').pop();
+        if (as) member = true;
+    } else {
+        // Firefox / Safari: "name@url"
+        const ff = /^([\w$./<]*)@/.exec(s);
+        if (ff) { name = ff[1].split(/[./<]/).filter(Boolean).pop() || ''; member = true; }
+    }
+    return member && CORE_REQUEST_FNS.has(name);
+}
+
 /** Splits a stack into frames: { tp: folder } / { bi: folder } / { core: path } / null. */
 function stackFrames(stack) {
     const out = [];
@@ -294,7 +317,10 @@ function stackFrames(stack) {
             try { folder = decodeURIComponent(folder); } catch { /* */ }
             if (PASS_THROUGH.has(folder)) { out.push({ self: true }); continue; }
             if (folder === 'ST-ExtensionDoctor' && tp[2] === 'probe.js') continue;
-            out.push({ tp: folder });
+            // An extension's replacement for one of ST's own request functions
+            // (e.g. a patched ConnectionManagerRequestService.sendRequest) only passes
+            // the call along — the extension that called it is the real sender.
+            out.push({ tp: folder, patch: isPatchedCoreFn(line) });
             continue;
         }
         const bi = /\/scripts\/extensions\/([^/]+)\//.exec(line);
@@ -340,6 +366,7 @@ function callerFromStack() {
         const fr = frames[k];
         if (fr.self) continue;
         if (fr.tp) {
+            if (fr.patch) continue;
             // A wrapper is skipped only where it wraps; deeper down it may be a real caller.
             if (k < j && fetchWrappers.has(fr.tp)) continue;
             return { kind: 'third', folder: fr.tp };
