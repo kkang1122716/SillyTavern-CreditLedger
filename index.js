@@ -245,6 +245,13 @@ function onGenStarted(type, _opts, dryRun) {
 }
 function onGenEnded() { currentGen = null; }
 
+// Names arrive one by one; redraw once after they settle, not once per name.
+let nameRenderTimer = null;
+function scheduleNameRender() {
+    clearTimeout(nameRenderTimer);
+    nameRenderTimer = setTimeout(() => { renderLog(); renderWho(); }, 300);
+}
+
 async function extDisplayName(folder) {
     if (extNames[folder] !== undefined) return extNames[folder];
     extNames[folder] = folder;
@@ -252,8 +259,7 @@ async function extDisplayName(folder) {
         const m = await fetch(`/scripts/extensions/third-party/${encodeURIComponent(folder)}/manifest.json`).then(r => r.ok ? r.json() : null);
         if (m?.display_name) extNames[folder] = String(m.display_name).slice(0, 40);
     } catch { /* keep folder name */ }
-    renderLog();
-    renderWho();
+    scheduleNameRender();
     return extNames[folder];
 }
 
@@ -482,7 +488,15 @@ function applyRules(entries) {
     return n;
 }
 
-async function installedExtensions() {
+let installedCache = null;
+
+/** Installed extensions for the "who?" picker. Cached; names load in parallel. */
+function installedExtensions() {
+    if (!installedCache) installedCache = loadInstalledExtensions().catch(() => { installedCache = null; return []; });
+    return installedCache;
+}
+
+async function loadInstalledExtensions() {
     const list = [];
     try {
         const res = await fetch('/api/extensions/discover', { headers: ctx().getRequestHeaders() });
@@ -492,8 +506,9 @@ async function installedExtensions() {
             if (!name.startsWith('third-party/')) continue;
             const folder = name.slice('third-party/'.length);
             if (PASS_THROUGH.has(folder)) continue;
-            list.push({ value: folder, label: await extDisplayName(folder) });
+            list.push({ value: folder, label: folder });
         }
+        await Promise.all(list.map(async x => { x.label = await extDisplayName(x.value); }));
     } catch { /* fall back to built-ins only */ }
     list.sort((a, b) => a.label.localeCompare(b.label, 'ko'));
     for (const label of new Set(Object.values(BUILTIN_EXT).filter(Boolean))) list.push({ value: `@${label}`, label: `${label} (기본 확장)` });
@@ -504,7 +519,16 @@ async function installedExtensions() {
 /** Lets the user say which extension sent a request, and learn from it. */
 async function labelEntry(e) {
     const { Popup, POPUP_TYPE } = ctx();
-    const exts = await installedExtensions();
+    if (labelEntry.busy) return;
+    labelEntry.busy = true;
+    let exts;
+    try {
+        document.body.style.cursor = 'progress';
+        exts = await installedExtensions();
+    } finally {
+        document.body.style.cursor = '';
+        labelEntry.busy = false;
+    }
     const sel = el('select', { class: 'text_pole' },
         el('option', { value: '', text: '— 고르세요 —' }),
         ...exts.map(x => el('option', { value: x.value, text: x.label, selected: e.ext === x.value })),
@@ -518,10 +542,10 @@ async function labelEntry(e) {
         el('h3', { text: '이 요청은 어느 확장이 보냈나요?' }),
         el('div', { class: 'cl-note', text: `${new Date(e.t).toLocaleString()} · ${e.model} · 입력 ${fmtTok(e.in)} / 출력 ${fmtTok(e.out)} · ${GEN_TYPES[e.gen] || ''}` }),
         sel, custom,
-        el('label', { class: 'checkbox_label' }, learn, document.createTextNode(' 비슷한 요청도 앞으로 이 확장으로 표시 (학습)')),
-        el('div', { class: 'cl-note', text: e.fp
+        e.fp ? el('label', { class: 'checkbox_label' }, learn, document.createTextNode(' 비슷한 요청도 앞으로 이 확장으로 표시 (학습)')) : null,
+        el('div', { class: e.fp ? 'cl-note' : 'cl-note cl-warn-text', text: e.fp
             ? '같은 확장은 보통 매번 비슷한 지시문을 보내요. 그 지시문의 지문(짧은 해시)만 저장해서 다음부터 알아봐요. 내용 자체는 저장하지 않아요.'
-            : '업데이트 전 기록이라 지문이 없어서 이 줄만 바꿔요. 학습은 새 기록부터 돼요.' }));
+            : '⚠️ 1.0.9 업데이트 전에 쌓인 기록이라 학습에 쓸 지문이 없어요. 이 줄 이름만 바뀌어요. 업데이트 후 새로 생긴 "알 수 없음" 기록에서 고르면 학습까지 돼요.' }));
     const ok = await new Popup(box, POPUP_TYPE.CONFIRM, '', { okButton: '저장', cancelButton: '취소' }).show();
     if (!ok) return;
     let ext = sel.value;
@@ -1202,6 +1226,7 @@ function renderLinks() {
 }
 
 function openWindow(tab) {
+    installedExtensions(); // warm up the "who?" list in the background
     if (windowPopup) { if (tab) selectTab(tab); return; }
     const { Popup, POPUP_TYPE } = ctx();
     const root = el('div', { class: 'cl-root cl-window' });
@@ -1853,7 +1878,7 @@ function renderWho() {
             const d = new Date(e.t);
             const time = (dayKey(e.t) === dayKey() ? '' : `${d.getMonth() + 1}/${d.getDate()} `) + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
             tbl.append(el('tr', {},
-                el('td', { text: time }),
+                el('td', { text: time + (e.fp ? '' : ' (이전)'), title: e.fp ? '' : '업데이트 전 기록: 이름만 바꿀 수 있고 학습은 안 돼요' }),
                 el('td', { text: e.chat || '—' }),
                 el('td', { text: e.model, class: 'cl-model' }),
                 el('td', { text: `${fmtTok(e.in)} / ${fmtTok(e.out + (e.think || 0))}${e.est ? ' ≈' : ''}` }),
@@ -1861,7 +1886,7 @@ function renderWho() {
                 el('td', {}, el('button', { class: 'menu_button cl-mini cl-who', text: '누구? ✎', onclick: () => labelEntry(e) }))));
         }
         card.append(tbl);
-        if (unknown.some(e => !e.fp)) card.append(el('div', { class: 'cl-note', text: '1.0.9 전에 쌓인 기록은 지문이 없어서 그 줄 이름만 바뀌고 학습은 안 돼요.' }));
+        if (unknown.some(e => !e.fp)) card.append(el('div', { class: 'cl-note', text: '"(이전)" 표시는 1.0.9 전에 쌓인 기록이에요. 지문이 없어서 그 줄 이름만 바뀌고 학습은 안 돼요. 학습은 표시가 없는 줄에서 해주세요.' }));
     }
     box.append(card, renderRules());
 }
