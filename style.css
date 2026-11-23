@@ -30,7 +30,13 @@
 .cl-root .cl-field { display: flex; flex-direction: column; gap: 2px; margin: 6px 0; }
 .cl-root .cl-field > span { font-size: 0.85em; opacity: 0.85; }
 .cl-root .cl-field small { opacity: 0.7; }
-.cl-root .cl-unit { max-width: 5em; }
+.cl-root .cl-unit { max-width: 5em; margin: 0; }
+.cl-root .cl-cur { width: auto; margin: 0; }
+.cl-root .cl-rate { max-width: 7em; margin: 0; }
+.cl-root .cl-link-row { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid var(--SmartThemeBorderColor); }
+.cl-root .cl-link-row > div { min-width: 12em; flex: 1; }
+.cl-root .cl-link-row select { width: auto; max-width: 100%; margin: 0; flex: 1 1 14em; }
+.cl-root h4 { margin: 10px 0 4px; }
 .cl-root .cl-section { margin: 8px 0; }
 .cl-root .cl-section summary { cursor: pointer; font-weight: bold; }
 .cl-root .cl-table { width: 100%; border-collapse: collapse; font-size: 0.8em; margin-top: 4px; }

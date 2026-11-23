@@ -100,12 +100,31 @@ function hostOf(url) {
     try { return new URL(String(url)).host.toLowerCase(); } catch { return ''; }
 }
 
+// Wallet currencies. Token prices are in USD; "rate" converts USD into the
+// wallet's currency (editable per wallet — defaults are rough).
+const CURRENCIES = [
+    { sym: '$', label: '달러 ($)', rate: 1 },
+    { sym: '₩', label: '원 (₩)', rate: 1400 },
+    { sym: '円', label: '엔 (円)', rate: 150 },
+    { sym: '¥', label: '위안 (¥)', rate: 7.2 },
+];
+const BIG_UNITS = new Set(['₩', '円', '원']);
+const SUFFIX_UNITS = new Set(['円', '원']);
+
+function rateOf(w) {
+    if (Number.isFinite(w?.rate) && w.rate > 0) return w.rate;
+    return CURRENCIES.find(c => c.sym === (w?.unit || '$'))?.rate || 1;
+}
+
 function fmt(n, unit = '$') {
     if (n === null || n === undefined || !Number.isFinite(n)) return '—';
     const a = Math.abs(n);
-    const digits = a === 0 ? 2 : a < 0.01 ? 5 : a < 1 ? 4 : a < 1000 ? 2 : 0;
+    const digits = BIG_UNITS.has(unit)
+        ? (a === 0 ? 0 : a < 10 ? 2 : a < 1000 ? 1 : 0)
+        : (a === 0 ? 2 : a < 0.01 ? 5 : a < 1 ? 4 : a < 1000 ? 2 : 0);
     const s = n.toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits });
     if (!unit) return s;
+    if (SUFFIX_UNITS.has(unit)) return `${s}${unit}`;
     return unit.length === 1 && unit !== 'tok' ? `${unit}${s}` : `${s} ${unit}`;
 }
 
@@ -128,21 +147,79 @@ function aliasHosts(w) {
     return (Array.isArray(w.aliases) ? w.aliases : []).map(hostOf).filter(Boolean);
 }
 
+function keyLinks(w) {
+    return (Array.isArray(w.keys) ? w.keys : []).map(k => k.id).filter(Boolean);
+}
+
+/**
+ * Which wallet a request belongs to. Order:
+ *  1. an address the user tied to a wallet (e.g. a personal Cloudflare Worker)
+ *  2. the exact API key the user tied to a wallet (several Vertex accounts)
+ *  3. a proxy wallet's own address
+ *  4. the type's default wallet — one of that type with no keys tied to it
+ */
 function walletFor(meta) {
     const host = meta.host;
-    // Extra addresses the user tied to a wallet win over everything else,
-    // e.g. a personal Cloudflare Worker that relays to the same Vertex account.
     if (host) {
         for (const w of S.wallets) if (aliasHosts(w).includes(host)) return w;
     }
+    if (meta.keyId && !meta.viaProxy) {
+        for (const w of S.wallets) if (keyLinks(w).includes(meta.keyId)) return w;
+    }
     for (const w of S.wallets) {
-        if (w.type === 'newapi' || w.type === 'manual') {
-            if (host && hostOf(w.url) === host) return w;
-        } else if (!meta.viaProxy && TYPES[w.type]?.source === meta.source) {
-            return w;
-        }
+        if ((w.type === 'newapi' || w.type === 'manual') && host && hostOf(w.url) === host) return w;
+    }
+    if (!meta.viaProxy) {
+        const same = S.wallets.filter(w => TYPES[w.type]?.source && TYPES[w.type].source === meta.source);
+        return same.find(w => !keyLinks(w).length) || null;
     }
     return null;
+}
+
+// ------------------------------------------------------------ active keys
+
+// Which stored key ST will use right now, per slot. ST sends no key id with a
+// normal generation — it uses the slot's active key — so we track it here from
+// ST's own masked key list (labels and ids only, never values).
+const KEY_SLOTS = {
+    api_key_vertexai: 'Vertex 키 (Express)',
+    vertexai_service_account_json: 'Vertex 서비스 계정',
+    api_key_makersuite: 'AI Studio 키',
+    api_key_deepseek: 'DeepSeek 키',
+};
+let activeKeys = {};
+let keyInfo = {};
+
+async function refreshActiveKeys() {
+    try {
+        const res = await fetch('/api/secrets/read', { method: 'POST', headers: ctx().getRequestHeaders() });
+        if (!res.ok) return;
+        const state = await res.json();
+        const act = {};
+        const info = {};
+        for (const slot of Object.keys(KEY_SLOTS)) {
+            for (const k of Array.isArray(state?.[slot]) ? state[slot] : []) {
+                info[k.id] = { slot, label: String(k.label || 'Key'), masked: String(k.value || ''), active: !!k.active };
+                if (k.active) act[slot] = k.id;
+            }
+        }
+        activeKeys = act;
+        keyInfo = info;
+    } catch { /* keep the last known state */ }
+}
+
+function keySlotFor(body) {
+    switch (body.chat_completion_source) {
+        case 'vertexai': return body.vertexai_auth_mode === 'full' ? 'vertexai_service_account_json' : 'api_key_vertexai';
+        case 'makersuite': return 'api_key_makersuite';
+        case 'deepseek': return 'api_key_deepseek';
+        default: return '';
+    }
+}
+
+function keyName(id) {
+    const k = keyInfo[id];
+    return k ? `${k.label} (${k.masked})` : '지워진 키';
 }
 
 function walletUnit(w) {
@@ -225,7 +302,9 @@ function inspectRequest(input, init) {
     let host = '';
     if (source === 'custom') host = hostOf(body.custom_url);
     else if (viaProxy) host = hostOf(body.reverse_proxy);
-    return { source, model: String(body.model || ''), host, viaProxy, stream: !!body.stream, messages: body.messages, t: Date.now() };
+    const slot = viaProxy ? '' : keySlotFor(body);
+    const keyId = slot ? (body.secret_id || activeKeys[slot] || '') : '';
+    return { source, model: String(body.model || ''), host, viaProxy, keyId, stream: !!body.stream, messages: body.messages, t: Date.now() };
 }
 
 function readGeminiUsage(o) {
@@ -329,10 +408,11 @@ function calibFactor(w) {
 
 /** Adds a token-priced cost to a non-lookup wallet. Returns the adjusted cost. */
 function chargeTokens(w, tokenCost, t) {
-    const adj = tokenCost * calibFactor(w);
+    const local = tokenCost * rateOf(w);
+    const adj = local * calibFactor(w);
     if (!w.base || t >= w.base.at) {
         w.spentSinceBase = (w.spentSinceBase || 0) + adj;
-        w.rawSinceBase = (w.rawSinceBase || 0) + tokenCost;
+        w.rawSinceBase = (w.rawSinceBase || 0) + local;
         w.estCalls = (w.estCalls || 0) + 1;
     }
     addDaily(w, adj, t);
@@ -362,6 +442,7 @@ function record(meta, usage, estimated) {
         w: w?.id || null,
         src: meta.source,
         host: meta.host,
+        keyId: meta.keyId || '',
         model: meta.model,
         in: usage.in, out: usage.out, think: usage.think, cached: usage.cached,
         est: estimated,
@@ -566,6 +647,7 @@ const WINDOW_HTML = `
 </div>
 <div class="cl-tabs">
   <button class="menu_button cl-tab" data-tab="wallets">지갑</button>
+  <button class="menu_button cl-tab" data-tab="links">연결 관리</button>
   <button class="menu_button cl-tab" data-tab="log">사용 기록</button>
   <button class="menu_button cl-tab" data-tab="prices">단가표</button>
   <button class="menu_button cl-tab" data-tab="diag">진단·설정</button>
@@ -578,6 +660,10 @@ const WINDOW_HTML = `
   </div>
   <div id="cl_editor" class="cl-editor" hidden></div>
   <div id="cl_wallets" class="cl-grid"></div>
+</section>
+<section data-pane="links" hidden>
+  <div class="cl-note">같은 Vertex라도 <b>계정이 다르면 지갑을 따로</b> 만들고, 여기서 키와 주소를 각 지갑(그룹)에 묶어주세요. "기본"으로 두면 그 종류의 기본 지갑(키가 하나도 안 묶인 지갑)으로 들어가요. 묶은 뒤에 보내는 채팅부터 그 지갑에서 빠져요.</div>
+  <div id="cl_links"></div>
 </section>
 <section data-pane="log" hidden>
   <div id="cl_log"></div>
@@ -627,6 +713,105 @@ function selectTab(tab) {
     document.querySelectorAll('.cl-window [data-pane]').forEach(p => { p.hidden = p.dataset.pane !== tab; });
     document.querySelectorAll('.cl-window .cl-tab').forEach(b => b.classList.toggle('cl-tab-on', b.dataset.tab === tab));
     if (tab === 'prices') renderPrices();
+    if (tab === 'links') refreshActiveKeys().then(renderLinks);
+}
+
+const KEY_TYPE = { api_key_vertexai: 'vertex', vertexai_service_account_json: 'vertex', api_key_makersuite: 'gemini', api_key_deepseek: 'deepseek' };
+
+function maskHost(h) {
+    // Personal relay names work like passwords, so don't print them in full.
+    const m = /^([^.]+)\.((?:[^.]+\.)?(?:workers|pages)\.dev)$/i.exec(h);
+    if (!m) return h;
+    const sub = m[1];
+    return `${sub.slice(0, 1)}${'•'.repeat(Math.max(3, sub.length - 2))}${sub.slice(-1)}.${m[2]}`;
+}
+
+function knownHosts() {
+    const hosts = new Set();
+    for (const p of ctx().extensionSettings.connectionManager?.profiles || []) {
+        const h = hostOf(p?.['api-url']);
+        if (h) hosts.add(h);
+    }
+    const o = ctx().chatCompletionSettings || {};
+    for (const u of [o.custom_url, o.reverse_proxy]) if (hostOf(u)) hosts.add(hostOf(u));
+    for (const e of S.entries) if (e.host) hosts.add(e.host);
+    for (const w of S.wallets) for (const h of aliasHosts(w)) hosts.add(h);
+    // A proxy wallet's own address is fixed to it — not something to re-tie.
+    for (const w of S.wallets) if (w.type === 'newapi' || w.type === 'manual') hosts.delete(hostOf(w.url));
+    return [...hosts].sort();
+}
+
+function newWalletOfType(type, name) {
+    const w = { id: uid(), name: name || TYPES[type].label, type, url: '', unit: TYPES[type].lookup ? '' : '$', auto: true, aliases: [], keys: [] };
+    S.wallets.push(w);
+    return w;
+}
+
+function tieKey(id, target) {
+    for (const w of S.wallets) w.keys = (w.keys || []).filter(k => k.id !== id);
+    if (target === 'default') return null;
+    const info = keyInfo[id];
+    const w = target === 'new' ? newWalletOfType(KEY_TYPE[info?.slot] || 'vertex', info?.label) : S.wallets.find(x => x.id === target);
+    if (!w) return null;
+    w.keys = [...(w.keys || []), { id, slot: info?.slot || '' }];
+    return w;
+}
+
+function tieHost(host, target) {
+    for (const w of S.wallets) w.aliases = (w.aliases || []).filter(a => hostOf(a) !== host);
+    if (target === 'none') return null;
+    const w = target === 'new' ? newWalletOfType('manual', maskHost(host)) : S.wallets.find(x => x.id === target);
+    if (!w) return null;
+    w.aliases = [...(w.aliases || []), `https://${host}`];
+    return w;
+}
+
+function renderLinks() {
+    const box = document.getElementById('cl_links');
+    if (!box) return;
+    box.replaceChildren();
+    const after = (w) => {
+        if (w) claimEntries(w);
+        save();
+        renderAll();
+        renderLinks();
+        if (w) toastr.success(`"${w.name}" 지갑에 묶었어요.`, '크레딧 장부');
+    };
+
+    const keyIds = Object.keys(keyInfo);
+    box.append(el('h4', { text: '🔑 저장된 키' }));
+    if (!keyIds.length) box.append(el('div', { class: 'cl-note', text: '실리태번에 저장된 Vertex·AI Studio·DeepSeek 키가 없어요.' }));
+    for (const id of keyIds) {
+        const k = keyInfo[id];
+        const type = KEY_TYPE[k.slot];
+        const owner = S.wallets.find(w => keyLinks(w).includes(id));
+        const sel = el('select', { class: 'text_pole' },
+            el('option', { value: 'default', text: '기본 (그 종류의 기본 지갑)', selected: !owner }),
+            ...S.wallets.filter(w => w.type === type).map(w => el('option', { value: w.id, text: `"${w.name}" 지갑에 묶기`, selected: owner?.id === w.id })),
+            el('option', { value: 'new', text: '＋ 새 지갑을 만들어 묶기' }));
+        sel.addEventListener('change', () => after(tieKey(id, sel.value)));
+        const dflt = owner ? null : walletFor({ source: TYPES[type]?.source, keyId: id });
+        box.append(el('div', { class: 'cl-link-row' },
+            el('div', {},
+                el('b', { text: k.label }), el('span', { class: 'cl-sub', text: ` ${k.masked}` }),
+                el('div', { class: 'cl-sub', text: `${KEY_SLOTS[k.slot]}${k.active ? ' · 지금 사용 중' : ''}${dflt ? ` · 지금은 "${dflt.name}"으로 계산` : owner ? '' : ' · 지금은 지갑 없음'}` })),
+            sel));
+    }
+
+    const hosts = knownHosts();
+    box.append(el('h4', { text: '🌐 주소 (워커·프록시 우회 주소)' }));
+    if (!hosts.length) box.append(el('div', { class: 'cl-note', text: '아직 본 주소가 없어요. 워커나 우회 주소로 한 번 채팅하거나, 연결 프로필에 저장하면 여기에 나와요.' }));
+    for (const h of hosts) {
+        const owner = S.wallets.find(w => aliasHosts(w).includes(h));
+        const sel = el('select', { class: 'text_pole' },
+            el('option', { value: 'none', text: '묶지 않음', selected: !owner }),
+            ...S.wallets.map(w => el('option', { value: w.id, text: `"${w.name}" 지갑에 묶기 (${TYPES[w.type].label})`, selected: owner?.id === w.id })),
+            el('option', { value: 'new', text: '＋ 새 지갑(기타)을 만들어 묶기' }));
+        sel.addEventListener('change', () => after(tieHost(h, sel.value)));
+        box.append(el('div', { class: 'cl-link-row' },
+            el('div', {}, el('b', { text: maskHost(h) })),
+            sel));
+    }
 }
 
 function openWindow(tab) {
@@ -732,7 +917,9 @@ function renderWallets() {
         if (rem.kind === 'real') sub.push(`조회 ${timeAgo(rem.at)}`);
         if (rem.kind === 'est') sub.push('추정치');
         if (w.real?.unlimited && Number.isFinite(w.real.used)) sub.push(`누적 사용 ${fmt(w.real.used, unit)}`);
+        if (keyLinks(w).length) sub.push(`묶인 키 ${keyLinks(w).length}개`);
         if (aliasHosts(w).length) sub.push(`묶인 주소 ${aliasHosts(w).length}개`);
+        if (TYPES[w.type]?.source && !keyLinks(w).length && S.wallets.some(x => x !== w && x.type === w.type)) sub.push('기본 지갑');
         if (!TYPES[w.type]?.lookup && calibFactor(w) !== 1) sub.push(`보정 ×${calibFactor(w).toFixed(2)}`);
         if (w.lastDelta) sub.push(`최근 변동 ${fmt(w.lastDelta.amount, unit)}${w.lastDelta.calls > 1 ? ` (${w.lastDelta.calls}회)` : ''}`);
 
@@ -788,7 +975,7 @@ async function calibrate(w) {
             reason: '',
         };
         if (report.actual < 0) report.reason = 'topup';
-        else if (report.calls < CALIB_MIN_CALLS || report.raw < CALIB_MIN_SPEND) report.reason = 'small';
+        else if (report.calls < CALIB_MIN_CALLS || report.raw / rateOf(w) < CALIB_MIN_SPEND) report.reason = 'small';
         else if (now - lastUse < CALIB_RECENT_MS) report.reason = 'recent';
         else {
             const measured = report.actual / report.raw;
@@ -817,7 +1004,7 @@ function showCalibReport(w, r) {
     if (r.measured) lines.push(`오차: 단가표 기준 ${r.measured >= 1 ? '+' : ''}${Math.round((r.measured - 1) * 100)}%`);
     const why = {
         topup: '잔액이 오히려 늘었어요. 충전이나 크레딧 추가가 있었던 것 같아서 이번엔 자동 보정하지 않았어요.',
-        small: `아직 사용량이 적어서(${CALIB_MIN_CALLS}회 또는 ${fmt(CALIB_MIN_SPEND, unit)} 미만) 비교하기 일러요. 잔액만 맞춰뒀어요.`,
+        small: `아직 사용량이 적어서(${CALIB_MIN_CALLS}회 또는 ${fmt(CALIB_MIN_SPEND * rateOf(w), unit)} 미만) 비교하기 일러요. 잔액만 맞춰뒀어요.`,
         recent: '마지막 사용이 3시간 이내예요. 구글 결제는 몇 시간 늦게 반영돼서 이번엔 자동 보정을 건너뛰고 잔액만 맞췄어요. 다음엔 사용 후 반나절~하루 지나서 보정하면 정확해요.',
         outlier: '차이가 너무 커요(5배 이상). 같은 결제 계정에서 다른 서비스를 썼거나, 단가표에 없는/틀린 모델이 있을 수 있어요. 자동 보정하지 않았어요.',
     }[r.reason];
@@ -861,14 +1048,11 @@ const SRC_TYPE = { vertexai: 'vertex', makersuite: 'gemini', deepseek: 'deepseek
 
 /** Moves unassigned past records that belong to wallet w into it. */
 function claimEntries(w) {
-    const hosts = aliasHosts(w);
-    const own = (w.type === 'newapi' || w.type === 'manual') ? hostOf(w.url) : '';
-    const src = TYPES[w.type]?.source;
     const lookup = TYPES[w.type]?.lookup;
     let n = 0;
     for (const e of S.entries) {
         if (e.w) continue;
-        const hit = (e.host && (hosts.includes(e.host) || e.host === own)) || (src && !e.host && e.src === src);
+        const hit = walletFor({ source: e.src, host: e.host, viaProxy: !!e.host && e.src !== 'custom', keyId: e.keyId }) === w;
         if (!hit) continue;
         e.w = w.id;
         n++;
@@ -901,6 +1085,7 @@ async function openImport() {
     const profiles = (ctx().extensionSettings.connectionManager?.profiles || []).filter(p => p && p.mode !== 'tc' && p.api);
     box.hidden = false;
     box.replaceChildren();
+    await refreshActiveKeys();
     if (!profiles.length) {
         box.append(el('div', { class: 'cl-note', text: '채팅 완성(Chat Completion) 연결 프로필이 없어요. 실리태번 API 연결 화면의 "연결 프로필"에서 먼저 저장해주세요.' }),
             el('button', { class: 'menu_button', text: '닫기', onclick: () => { box.hidden = true; } }));
@@ -918,24 +1103,35 @@ async function openImport() {
         if (source === 'custom') { url = p['api-url'] || ''; host = hostOf(url); }
         else if (proxyName && proxyHost[proxyName]) { host = proxyHost[proxyName]; url = `https://${host}`; }
         const viaProxy = !!proxyName;
-        const k = host || source;
-        const existing = walletFor({ source, host, viaProxy });
+        const type = SRC_TYPE[source];
+        // A saved key id tells different accounts of the same kind apart.
+        const sid = !host && type ? (p['secret-id'] || '') : '';
+        const k = host || (sid ? `${source}|${sid}` : source);
+        const existing = sid
+            ? S.wallets.find(w => keyLinks(w).includes(sid))
+            : walletFor({ source, host, viaProxy });
         const opts = [['skip', '가져오지 않기']];
         if (host) {
             opts.push(['new:newapi', '새 지갑: 프록시 (잔액 조회)'], ['new:manual', '새 지갑: 기타 (단가로 계산)'],
                 ['join:vertex', 'Vertex 지갑에 묶기 (같은 Vertex 계정)'], ['join:gemini', 'AI Studio 지갑에 묶기 (같은 구글 키)']);
             for (const w of S.wallets) if (!TYPES[w.type].lookup && w.type !== 'vertex' && w.type !== 'gemini') opts.push([`join:${w.id}`, `"${w.name}" 지갑에 묶기`]);
-        } else if (SRC_TYPE[source]) {
-            opts.push([`new:${SRC_TYPE[source]}`, `새 지갑: ${TYPES[SRC_TYPE[source]].label}`]);
+        } else if (type) {
+            opts.push([`new:${type}`, sid ? `새 지갑 (이 계정 전용): ${TYPES[type].label}` : `새 지갑: ${TYPES[type].label}`]);
+            if (sid) for (const w of S.wallets.filter(x => x.type === type)) opts.push([`join:${w.id}`, `"${w.name}" 지갑에 묶기 (같은 계정)`]);
         }
         let def = 'skip';
         let note = '';
+        const sameType = type ? S.wallets.filter(x => x.type === type) : [];
         if (existing) note = `이미 "${existing.name}" 지갑에 들어가요`;
         else if (seen.has(k)) note = '위 프로필과 같은 연결이에요';
         else if (!host && proxyName) note = '프록시 프리셋 주소를 못 찾았어요';
         else if (host) def = isRelay(url) ? 'join:vertex' : 'new:newapi';
-        else if (SRC_TYPE[source]) def = `new:${SRC_TYPE[source]}`;
+        else if (sid && sameType.length === 1 && !keyLinks(sameType[0]).length) {
+            def = `join:${sameType[0].id}`;
+            note = `"${sameType[0].name}" 지갑과 같은 계정인지 확인해주세요. 다른 계정이면 "새 지갑"을 고르세요.`;
+        } else if (type) def = `new:${type}`;
         else note = `${source}는 아직 지원하지 않아요`;
+        if (sid && keyInfo[sid]) note = [`키: ${keyName(sid)}`, note].filter(Boolean).join(' · ');
         if (!existing) seen.add(k);
         let keyRef = null;
         if (source === 'custom') {
@@ -944,7 +1140,7 @@ async function openImport() {
         } else if (proxyName) keyRef = { slot: 'proxy', name: proxyName };
         const desc = [source, host || '', keyRef?.slot === 'custom' ? `키: ${keyLabel(keyRef.id)?.label || '이름 모름'}` : proxyName ? `프록시: ${proxyName}` : '', p.model || ''].filter(Boolean).join(' · ');
         const sel = el('select', { class: 'text_pole' }, ...opts.map(([v, t]) => el('option', { value: v, text: t, selected: v === def })));
-        return { p, source, host, url, keyRef, sel, desc, note };
+        return { p, source, host, url, keyRef, sel, desc, note, sid };
     });
 
     const list = el('div', { class: 'cl-import' });
@@ -961,8 +1157,7 @@ async function openImport() {
             const findOrMake = (type) => {
                 let w = S.wallets.find(x => x.type === type);
                 if (!w) {
-                    w = { id: uid(), name: type === 'vertex' ? 'Vertex' : 'AI Studio', type, url: '', unit: '$', auto: true, aliases: [] };
-                    S.wallets.push(w);
+                    w = newWalletOfType(type, type === 'vertex' ? 'Vertex' : 'AI Studio');
                     created.push(w);
                 }
                 return w;
@@ -973,18 +1168,26 @@ async function openImport() {
                 if (v === 'skip') continue;
                 if (v.startsWith('new:')) {
                     const type = v.slice(4);
-                    if (TYPES[type].source && S.wallets.some(x => x.type === type)) continue;
+                    if (TYPES[type].source && !r.sid && S.wallets.some(x => x.type === type)) continue;
+                    if (r.sid && S.wallets.some(x => keyLinks(x).includes(r.sid))) continue;
                     if (!TYPES[type].source && S.wallets.some(x => hostOf(x.url) === r.host || aliasHosts(x).includes(r.host))) continue;
-                    const w = { id: uid(), name: r.p.name || TYPES[type].label, type, url: TYPES[type].source ? '' : r.url, unit: TYPES[type].lookup ? '' : '$', auto: true, aliases: [] };
+                    const w = newWalletOfType(type, r.p.name || TYPES[type].label);
+                    if (!TYPES[type].source) w.url = r.url;
                     if (type === 'newapi') w.keyRef = r.keyRef;
-                    if (type === 'deepseek') w.secretId = r.p['secret-id'] || '';
-                    S.wallets.push(w);
+                    if (type === 'deepseek') w.secretId = r.sid;
+                    if (r.sid) w.keys = [{ id: r.sid, slot: keyInfo[r.sid]?.slot || '' }];
                     created.push(w);
                 } else if (v.startsWith('join:')) {
                     const target = v.slice(5);
                     const w = (target === 'vertex' || target === 'gemini') ? findOrMake(target) : S.wallets.find(x => x.id === target);
-                    if (!w || S.wallets.some(x => aliasHosts(x).includes(r.host))) continue;
-                    w.aliases = [...(w.aliases || []), r.url];
+                    if (!w) continue;
+                    if (r.sid) {
+                        if (S.wallets.some(x => keyLinks(x).includes(r.sid))) continue;
+                        w.keys = [...(w.keys || []), { id: r.sid, slot: keyInfo[r.sid]?.slot || '' }];
+                    } else {
+                        if (S.wallets.some(x => aliasHosts(x).includes(r.host))) continue;
+                        w.aliases = [...(w.aliases || []), r.url];
+                    }
                     joined++;
                 }
             }
@@ -1041,7 +1244,27 @@ async function openEditor(existing, preset) {
     const keySel = el('select', { class: 'text_pole' });
     const dsSel = el('select', { class: 'text_pole' });
     const startBal = el('input', { class: 'text_pole', type: 'number', step: 'any', value: existing?.base?.amount ?? '', placeholder: '예: 287.40' });
-    const unit = el('input', { class: 'text_pole cl-unit', value: w.unit || '', placeholder: '$' });
+    const curNow = w.unit || '$';
+    const known = CURRENCIES.find(c => c.sym === curNow);
+    const curSel = el('select', { class: 'text_pole cl-cur' },
+        ...CURRENCIES.map(c => el('option', { value: c.sym, text: c.label, selected: known?.sym === c.sym })),
+        el('option', { value: 'custom', text: '직접 입력', selected: !known }));
+    const unit = el('input', { class: 'text_pole cl-unit', value: known ? '' : curNow, placeholder: '예: €' });
+    const rate = el('input', { class: 'text_pole cl-rate', type: 'number', step: 'any', min: '0', value: String(rateOf(w)) });
+    const rateLabel = el('span', { class: 'cl-sub' });
+    const syncCur = (fromSelect) => {
+        const custom = curSel.value === 'custom';
+        unit.hidden = !custom;
+        const sym = custom ? (unit.value.trim() || '?') : curSel.value;
+        if (fromSelect && !custom) rate.value = String(CURRENCIES.find(c => c.sym === sym).rate);
+        rateLabel.textContent = `1달러 = `;
+        rate.hidden = sym === '$';
+        rateLabel.hidden = sym === '$';
+        rateSuffix.textContent = sym === '$' ? '' : sym;
+    };
+    const rateSuffix = el('span', { class: 'cl-sub' });
+    curSel.addEventListener('change', () => syncCur(true));
+    unit.addEventListener('input', () => syncCur(false));
     const auto = el('input', { type: 'checkbox', checked: w.auto !== false });
     const aliases = el('textarea', { class: 'text_pole', rows: '2', placeholder: 'https://내워커.workers.dev/v1' });
     aliases.value = (w.aliases || []).join('\n');
@@ -1067,7 +1290,12 @@ async function openEditor(existing, preset) {
     const rowKey = el('label', { class: 'cl-field' }, el('span', { text: '잔액 조회에 쓸 키 (실리태번에 저장된 것 중에서)' }), keySel,
         el('small', { text: '키 값은 서버 밖으로 나오지 않아요. 여기엔 이름과 끝 3글자만 보여요. 이 주소에 맞는 키를 골라야 해요.' }));
     const rowDs = el('label', { class: 'cl-field' }, el('span', { text: 'DeepSeek 키' }), dsSel);
-    const rowBal = el('label', { class: 'cl-field' }, el('span', { text: '지금 남은 잔액 (콘솔에서 확인한 값)' }), el('div', { class: 'cl-row' }, startBal, unit));
+    const rowBal = el('div', { class: 'cl-field' },
+        el('span', { text: '화폐 단위 (콘솔에 보이는 잔액 기준)' }),
+        el('div', { class: 'cl-row' }, curSel, unit, rateLabel, rate, rateSuffix),
+        el('small', { text: '단가표는 달러 기준이라, 원·엔·위안이면 환율로 바꿔서 계산해요. 환율이 조금 틀려도 자동 보정이 맞춰가요.' }),
+        el('span', { text: '지금 남은 잔액 (콘솔에서 확인한 값)' }), startBal);
+    syncCur(false);
     const rowAuto = el('label', { class: 'checkbox_label' }, auto, el('span', { text: '답장 후 자동으로 잔액 조회 (같은 지갑은 1분에 최대 1번)' }));
     const rowAlias = el('label', { class: 'cl-field' },
         el('span', { text: '같은 계정으로 계산할 다른 주소 (한 줄에 하나, 선택)' }), aliases,
@@ -1094,10 +1322,18 @@ async function openEditor(existing, preset) {
                 name: name.value.trim() || TYPES[t].label,
                 type: t,
                 url: url.value.trim(),
-                unit: unit.value.trim(),
+                unit: TYPES[t].lookup ? (w.unit || '') : (curSel.value === 'custom' ? unit.value.trim().slice(0, 4) : curSel.value),
+                rate: TYPES[t].lookup ? undefined : (curSel.value === '$' ? 1 : Number(rate.value)),
                 auto: auto.checked,
                 aliases: aliases.value.split(/\s+/).map(s => s.trim()).filter(Boolean),
             };
+            if (!TYPES[t].lookup) {
+                if (!out.unit) { toastr.warning('화폐 단위를 입력해주세요.'); return; }
+                if (!(out.rate > 0)) { toastr.warning('환율을 숫자로 입력해주세요. (예: 1달러 = 1400원)'); return; }
+                if (existing?.base && existing.unit && existing.unit !== out.unit && startBal.value === String(existing.base.amount)) {
+                    toastr.info('화폐 단위가 바뀌었어요. 남은 잔액도 새 단위로 다시 입력해주세요.', '크레딧 장부', { timeOut: 8000 });
+                }
+            }
             const badAlias = out.aliases.find(a => !hostOf(a));
             if (badAlias) { toastr.warning(`주소 형식을 확인해주세요: ${badAlias.slice(0, 40)}`); return; }
             const taken = S.wallets.find(x => x.id !== out.id && aliasHosts(x).some(h => aliasHosts(out).includes(h)));
@@ -1124,7 +1360,8 @@ async function openEditor(existing, preset) {
             // Past unassigned requests that belong here now get counted.
             claimEntries(out);
             const dupe = S.wallets.find(x => x.id !== out.id && x.type === out.type && (TYPES[t].source ? true : hostOf(x.url) === hostOf(out.url)));
-            if (dupe) toastr.info(`"${dupe.name}"과 같은 연결이라, 기록은 먼저 만든 지갑으로 들어가요.`);
+            if (dupe && TYPES[t].source) toastr.info(`같은 종류 지갑이 여러 개예요. 계정마다 나누려면 관리 창의 "연결 관리" 탭에서 키를 각 지갑에 묶어주세요.`, '크레딧 장부', { timeOut: 8000 });
+            else if (dupe) toastr.info(`"${dupe.name}"과 같은 주소라, 기록은 먼저 만든 지갑으로 들어가요.`);
             box.hidden = true;
             save();
             renderAll();
@@ -1261,6 +1498,11 @@ function mountPanel() {
         };
         if (document.getElementById('extensions_settings')) start();
         eventSource.on(event_types.APP_READY, start);
+        refreshActiveKeys();
+        eventSource.on(event_types.APP_READY, refreshActiveKeys);
+        for (const ev of ['SECRET_WRITTEN', 'SECRET_DELETED', 'SECRET_ROTATED', 'SECRET_EDITED']) {
+            if (event_types[ev]) eventSource.on(event_types[ev], () => { refreshActiveKeys().then(() => { if (windowPopup) renderLinks(); }); });
+        }
         setInterval(() => { try { renderChip(); } catch { /* */ } }, 60_000);
     } catch (e) {
         console.warn('[credit-ledger] failed to start', e);
