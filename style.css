@@ -36,8 +36,26 @@
 .cl-root .cl-table { width: 100%; border-collapse: collapse; font-size: 0.8em; margin-top: 4px; }
 .cl-root .cl-table th, .cl-root .cl-table td { padding: 3px 4px; border-bottom: 1px solid var(--SmartThemeBorderColor); text-align: left; vertical-align: top; }
 .cl-root .cl-model { word-break: break-all; }
-.cl-root .cl-prices input { min-width: 0; width: 100%; padding: 2px 4px; margin: 0; }
-.cl-root .cl-prices td:first-child { min-width: 9em; }
 .cl-root .cl-import-row { display: flex; flex-direction: column; gap: 4px; padding: 6px 0; border-bottom: 1px solid var(--SmartThemeBorderColor); }
 .cl-root .cl-import-row select { margin: 0; }
+.cl-root .cl-wide-btn { width: 100%; margin: 6px 0; }
+.cl-window { text-align: left; }
+.cl-window .cl-win-head { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; margin-bottom: 6px; padding-right: 24px; }
+.cl-window .cl-win-head b { font-size: 1.2em; }
+.cl-window .cl-tabs { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 8px; border-bottom: 1px solid var(--SmartThemeBorderColor); padding-bottom: 6px; }
+.cl-window .cl-tab { width: auto; margin: 0; padding: 4px 12px; opacity: 0.6; }
+.cl-window .cl-tab.cl-tab-on { opacity: 1; font-weight: bold; outline: 1px solid var(--SmartThemeQuoteColor, currentColor); }
+.cl-window .cl-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 8px; }
+.cl-window .cl-grid .cl-card { margin: 0; }
+.cl-root .cl-prices { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 8px; margin-top: 6px; }
+.cl-root .cl-price { border: 1px solid var(--SmartThemeBorderColor); border-radius: 8px; padding: 6px 8px; }
+.cl-root .cl-price.cl-off { opacity: 0.5; }
+.cl-root .cl-price-head { display: flex; gap: 6px; align-items: center; }
+.cl-root .cl-price-head input { flex: 1; min-width: 0; margin: 0; font-weight: bold; }
+.cl-root .cl-price-fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(80px, 1fr)); gap: 4px 6px; margin-top: 4px; }
+.cl-root .cl-price-fields label { display: flex; flex-direction: column; font-size: 0.75em; opacity: 0.9; }
+.cl-root .cl-price-fields input { margin: 0; padding: 2px 4px; min-width: 0; width: 100%; font-size: 1.15em; }
+.cl-report p { margin: 6px 0; text-align: left; }
+.toast.cl-bank-toast { background-color: #1f6f5c !important; }
+.toast.cl-bank-toast .toast-title { font-weight: bold; }
 .cl-root [hidden] { display: none !important; }
