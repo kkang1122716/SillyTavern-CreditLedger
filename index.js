@@ -255,6 +255,31 @@ async function extDisplayName(folder) {
     return extNames[folder];
 }
 
+// Extensions seen wrapping window.fetch (retry, logging…). They sit between
+// the real caller and our hook on every request, so they are never "the caller".
+const fetchWrappers = new Set();
+
+/** Splits a stack into frames: { tp: folder } / { bi: folder } / { core: path } / null. */
+function stackFrames(stack) {
+    const out = [];
+    for (const line of stack.split('\n').slice(1)) {
+        const tp = /\/scripts\/extensions\/third-party\/([^/]+)\/([^:?#\s)]+)/.exec(line);
+        if (tp) {
+            let folder = tp[1];
+            try { folder = decodeURIComponent(folder); } catch { /* */ }
+            if (PASS_THROUGH.has(folder)) { out.push({ self: true }); continue; }
+            if (folder === 'ST-ExtensionDoctor' && tp[2] === 'probe.js') continue;
+            out.push({ tp: folder });
+            continue;
+        }
+        const bi = /\/scripts\/extensions\/([^/]+)\//.exec(line);
+        if (bi && bi[1] !== 'third-party') { out.push({ bi: bi[1] }); continue; }
+        const core = /https?:\/\/[^/\s]+(\/[^:?#\s)]+\.m?js)/.exec(line);
+        if (core) out.push({ core: core[1] });
+    }
+    return out;
+}
+
 /** Finds the extension (if any) whose code started this request. */
 function callerFromStack() {
     const old = Error.stackTraceLimit;
@@ -265,20 +290,36 @@ function callerFromStack() {
     } catch { /* */ } finally {
         Error.stackTraceLimit = old;
     }
+    const frames = stackFrames(stack);
+    // Drop our own frames at the top.
+    let i = 0;
+    while (i < frames.length && frames[i].self) i++;
+    // The frames right above our hook belong to whoever wrapped fetch after us.
+    // If ST's own request code (or another extension) comes after them, they were
+    // only passing the request along — remember them as wrappers.
+    const run = [];
+    let j = i;
+    while (j < frames.length && frames[j].tp) run.push(frames[j++].tp);
+    if (run.length && j < frames.length) {
+        const lastOfRun = run[run.length - 1];
+        const next = frames[j];
+        const nextIsSender = next.core && /\/scripts\/(openai|textgen-settings|custom-request|nai-settings|kai-settings|horde)\.js$|\/script\.js$/.test(next.core);
+        for (const f of run) if (f !== lastOfRun || nextIsSender) fetchWrappers.add(f);
+    } else {
+        // Ran out of frames: everything but the last folder of the run is a wrapper.
+        for (const f of run.slice(0, -1)) fetchWrappers.add(f);
+    }
     let viaSlash = false;
-    for (const line of stack.split('\n')) {
-        const tp = /\/scripts\/extensions\/third-party\/([^/]+)\/([^:?#\s)]+)/.exec(line);
-        if (tp) {
-            const folder = decodeURIComponent(tp[1]);
-            if (PASS_THROUGH.has(folder)) continue;
-            if (folder === 'ST-ExtensionDoctor' && tp[2] === 'probe.js') continue;
-            return { kind: 'third', folder };
+    for (let k = i; k < frames.length; k++) {
+        const fr = frames[k];
+        if (fr.self) continue;
+        if (fr.tp) {
+            // A wrapper is skipped only where it wraps; deeper down it may be a real caller.
+            if (k < j && fetchWrappers.has(fr.tp)) continue;
+            return { kind: 'third', folder: fr.tp };
         }
-        const bi = /\/scripts\/extensions\/([^/]+)\//.exec(line);
-        if (bi && bi[1] !== 'third-party' && BUILTIN_EXT[bi[1]] !== null) {
-            return { kind: 'builtin', label: BUILTIN_EXT[bi[1]] || bi[1] };
-        }
-        if (/\/scripts\/slash-commands/.test(line)) viaSlash = true;
+        if (fr.bi && BUILTIN_EXT[fr.bi] !== null) return { kind: 'builtin', label: BUILTIN_EXT[fr.bi] || fr.bi };
+        if (fr.core && /\/scripts\/slash-commands/.test(fr.core)) viaSlash = true;
     }
     return viaSlash ? { kind: 'slash' } : null;
 }
@@ -292,13 +333,16 @@ function captureOrigin() {
     } catch { /* */ }
     let chatId = '';
     try { chatId = String(c.getCurrentChatId?.() || ''); } catch { /* */ }
-    const gen = currentGen && Date.now() - currentGen.at < 10 * 60 * 1000 ? currentGen.type : 'raw';
+    // One generation sends one successful request. Once that is recorded, later
+    // requests (or a generation that died without an END event) are not "it".
+    const g = currentGen && !currentGen.used && Date.now() - currentGen.at < 10 * 60 * 1000 ? currentGen : null;
+    const gen = g ? g.type : 'raw';
     const caller = callerFromStack();
     let ext = '';
     if (caller?.kind === 'third') { ext = caller.folder; extDisplayName(caller.folder); }
     else if (caller?.kind === 'builtin') ext = `@${caller.label}`;
     else if (caller?.kind === 'slash') ext = '@슬래시 명령 / 퀵 리플라이';
-    return { chat: String(chat).slice(0, 60), chatId: chatId.slice(0, 120), gen, ext };
+    return { chat: String(chat).slice(0, 60), chatId: chatId.slice(0, 120), gen, ext, genRef: g };
 }
 
 function extLabel(e) {
@@ -454,6 +498,7 @@ async function estimateUsage(meta, outText) {
 
 async function handleResponse(meta, res) {
     if (!res.ok) return;
+    if (meta.origin?.genRef) meta.origin.genRef.used = true;
     let usage = null;
     let outText = '';
     const ctype = res.headers.get('content-type') || '';
