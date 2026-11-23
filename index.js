@@ -10,7 +10,7 @@
 const MODULE = 'creditLedger';
 const PLUGIN = '/api/plugins/credit-ledger';
 const GEN_PATH = '/api/backends/chat-completions/generate';
-const MAX_ENTRIES = 300;
+const MAX_ENTRIES = 800;
 const DAILY_KEEP_DAYS = 62;
 const AUTO_DELAY_MS = 10_000;
 const AUTO_MIN_GAP_MS = 60_000;
@@ -49,6 +49,10 @@ const defaultSettings = Object.freeze({
     showChip: true,
     notify: true,
     autoCalib: true,
+    showChat: true,
+    showExt: true,
+    showGen: true,
+    showModel: false,
     wallets: [],
     prices: DEFAULT_PRICES,
     pricesVersion: PRICES_VERSION,
@@ -217,6 +221,103 @@ function keySlotFor(body) {
     }
 }
 
+// ------------------------------------------------------------ where a request came from
+
+const GEN_TYPES = {
+    normal: '일반 답장', swipe: '스와이프', regenerate: '재생성', continue: '이어쓰기',
+    impersonate: '대신 쓰기', quiet: '백그라운드', raw: '백그라운드 (직접)',
+};
+// Built-in extensions, by folder name.
+const BUILTIN_EXT = {
+    memory: '요약 (Summarize)', expressions: '표정 (Expressions)', 'stable-diffusion': '이미지 생성',
+    vectors: '벡터 저장소', translate: '번역', 'quick-reply': '퀵 리플라이', caption: '이미지 캡션',
+    tts: 'TTS', 'regex': '정규식', 'token-counter': '토큰 카운터', 'connection-manager': null, 'shared.js': null,
+};
+// Frames that only pass a request along — never "the caller".
+const PASS_THROUGH = new Set(['SillyTavern-CreditLedger']);
+let currentGen = null;
+const extNames = {};
+
+function onGenStarted(type, _opts, dryRun) {
+    if (dryRun) return;
+    currentGen = { type: type || 'normal', at: Date.now() };
+}
+function onGenEnded() { currentGen = null; }
+
+async function extDisplayName(folder) {
+    if (extNames[folder] !== undefined) return extNames[folder];
+    extNames[folder] = folder;
+    try {
+        const m = await fetch(`/scripts/extensions/third-party/${encodeURIComponent(folder)}/manifest.json`).then(r => r.ok ? r.json() : null);
+        if (m?.display_name) extNames[folder] = String(m.display_name).slice(0, 40);
+    } catch { /* keep folder name */ }
+    renderLog();
+    return extNames[folder];
+}
+
+/** Finds the extension (if any) whose code started this request. */
+function callerFromStack() {
+    const old = Error.stackTraceLimit;
+    let stack = '';
+    try {
+        Error.stackTraceLimit = 80;
+        stack = String(new Error().stack || '');
+    } catch { /* */ } finally {
+        Error.stackTraceLimit = old;
+    }
+    let viaSlash = false;
+    for (const line of stack.split('\n')) {
+        const tp = /\/scripts\/extensions\/third-party\/([^/]+)\/([^:?#\s)]+)/.exec(line);
+        if (tp) {
+            const folder = decodeURIComponent(tp[1]);
+            if (PASS_THROUGH.has(folder)) continue;
+            if (folder === 'ST-ExtensionDoctor' && tp[2] === 'probe.js') continue;
+            return { kind: 'third', folder };
+        }
+        const bi = /\/scripts\/extensions\/([^/]+)\//.exec(line);
+        if (bi && bi[1] !== 'third-party' && BUILTIN_EXT[bi[1]] !== null) {
+            return { kind: 'builtin', label: BUILTIN_EXT[bi[1]] || bi[1] };
+        }
+        if (/\/scripts\/slash-commands/.test(line)) viaSlash = true;
+    }
+    return viaSlash ? { kind: 'slash' } : null;
+}
+
+function captureOrigin() {
+    const c = ctx();
+    let chat = '';
+    try {
+        if (c.groupId) chat = c.groups?.find(g => g.id === c.groupId)?.name || '그룹 채팅';
+        else if (c.characterId !== undefined && c.characters?.[c.characterId]) chat = c.characters[c.characterId].name;
+    } catch { /* */ }
+    let chatId = '';
+    try { chatId = String(c.getCurrentChatId?.() || ''); } catch { /* */ }
+    const gen = currentGen && Date.now() - currentGen.at < 10 * 60 * 1000 ? currentGen.type : 'raw';
+    const caller = callerFromStack();
+    let ext = '';
+    if (caller?.kind === 'third') { ext = caller.folder; extDisplayName(caller.folder); }
+    else if (caller?.kind === 'builtin') ext = `@${caller.label}`;
+    else if (caller?.kind === 'slash') ext = '@슬래시 명령 / 퀵 리플라이';
+    return { chat: String(chat).slice(0, 60), chatId: chatId.slice(0, 120), gen, ext };
+}
+
+function extLabel(e) {
+    if (!e.ext && !e.gen) return '(이전 기록)';
+    if (!e.ext) return ['normal', 'swipe', 'regenerate', 'continue', 'impersonate'].includes(e.gen) ? '직접 채팅' : '알 수 없음';
+    if (e.ext.startsWith('@')) return e.ext.slice(1);
+    if (extNames[e.ext] === undefined) extDisplayName(e.ext);
+    return extNames[e.ext] || e.ext;
+}
+
+function originText(e, opts = S) {
+    const parts = [];
+    if (opts.showChat && e.chat) parts.push(`💬 ${e.chat}`);
+    if (opts.showExt) parts.push(extLabel(e));
+    if (opts.showGen && e.gen) parts.push(GEN_TYPES[e.gen] || e.gen);
+    if (opts.showModel && e.model) parts.push(e.model);
+    return parts.join(' · ');
+}
+
 function keyName(id) {
     const k = keyInfo[id];
     return k ? `${k.label} (${k.masked})` : '지워진 키';
@@ -304,7 +405,9 @@ function inspectRequest(input, init) {
     else if (viaProxy) host = hostOf(body.reverse_proxy);
     const slot = viaProxy ? '' : keySlotFor(body);
     const keyId = slot ? (body.secret_id || activeKeys[slot] || '') : '';
-    return { source, model: String(body.model || ''), host, viaProxy, keyId, stream: !!body.stream, messages: body.messages, t: Date.now() };
+    let origin = {};
+    try { origin = captureOrigin(); } catch { /* never block a request */ }
+    return { source, model: String(body.model || ''), host, viaProxy, keyId, origin, stream: !!body.stream, messages: body.messages, t: Date.now() };
 }
 
 function readGeminiUsage(o) {
@@ -419,15 +522,19 @@ function chargeTokens(w, tokenCost, t) {
     return adj;
 }
 
-function notifyWithdraw(w, amount, calls = 1) {
+function notifyWithdraw(w, amount, entries = []) {
     if (!S.notify || !w || !Number.isFinite(amount) || amount <= 0) return;
     const unit = walletUnit(w);
     const rem = remainingOf(w);
     const remText = rem.kind === 'real' ? fmt(rem.value, unit) : rem.kind === 'est' ? `~${fmt(rem.value, unit)}` : '';
+    const calls = entries.length || 1;
     const what = calls > 1 ? ` (최근 ${calls}회 합계)` : '';
-    const msg = `−${fmt(amount, unit)}${what}${remText ? ` · 잔액 ${remText}` : ''}`;
+    const line1 = `−${fmt(amount, unit)}${what}${remText ? ` · 잔액 ${remText}` : ''}`;
+    const origins = [...new Set(entries.map(e => originText(e)).filter(Boolean))];
+    const line2 = origins.length > 2 ? `${origins.slice(0, 2).join(' / ')} 외 ${origins.length - 2}곳` : origins.join(' / ');
+    const html = escapeHtml(line1) + (line2 ? `<br><small>📍 ${escapeHtml(line2)}</small>` : '');
     try {
-        toastr.info(msg, `💳 ${w.name} 출금`, { timeOut: 4500, extendedTimeOut: 2000, toastClass: 'toast cl-bank-toast', preventDuplicates: false });
+        toastr.info(html, `💳 ${escapeHtml(w.name)} 출금`, { timeOut: 5000, extendedTimeOut: 2000, toastClass: 'toast cl-bank-toast', preventDuplicates: false, escapeHtml: false });
     } catch { /* ignore */ }
 }
 
@@ -443,6 +550,10 @@ function record(meta, usage, estimated) {
         src: meta.source,
         host: meta.host,
         keyId: meta.keyId || '',
+        chat: meta.origin?.chat || '',
+        chatId: meta.origin?.chatId || '',
+        gen: meta.origin?.gen || '',
+        ext: meta.origin?.ext || '',
         model: meta.model,
         in: usage.in, out: usage.out, think: usage.think, cached: usage.cached,
         est: estimated,
@@ -463,7 +574,7 @@ function record(meta, usage, estimated) {
     save();
     if (w && lookup && w.auto !== false && pluginOk) scheduleRefresh(w, AUTO_DELAY_MS);
     renderAll();
-    if (w && !lookup && entry.cost) notifyWithdraw(w, entry.cost);
+    if (w && !lookup && entry.cost) notifyWithdraw(w, entry.cost, [entry]);
 }
 
 function installFetchHook() {
@@ -564,7 +675,7 @@ function applyBalance(w, r) {
             if (delta > 0) addDaily(w, delta);
             w.lastDelta = { amount: delta, calls: pending.length, at: next.at };
             w.real = next;
-            notifyWithdraw(w, delta, pending.length || 1);
+            notifyWithdraw(w, delta, pending);
             return;
         }
     } else if (!prev) {
@@ -622,6 +733,15 @@ function renderChip() {
 
 // ------------------------------------------------------------ UI: drawer + window
 
+const ORIGIN_OPTS_HTML = `
+      <div class="cl-subopts">
+        <div class="cl-sub">출금 알림·사용 기록에 표시할 사용처</div>
+        <label class="checkbox_label"><input class="cl-opt" data-opt="showChat" type="checkbox"> 채팅 (캐릭터·그룹 이름)</label>
+        <label class="checkbox_label"><input class="cl-opt" data-opt="showExt" type="checkbox"> 보낸 곳 (채팅 / 확장 이름)</label>
+        <label class="checkbox_label"><input class="cl-opt" data-opt="showGen" type="checkbox"> 생성 종류 (일반·스와이프·백그라운드 등)</label>
+        <label class="checkbox_label"><input class="cl-opt" data-opt="showModel" type="checkbox"> 모델 이름</label>
+      </div>`;
+
 const DRAWER_HTML = `
 <div id="cl_settings" class="cl-root">
   <div class="inline-drawer">
@@ -635,6 +755,7 @@ const DRAWER_HTML = `
       <div class="cl-note">입력창 위 요약 줄이나 왼쪽 아래 ✨ 메뉴의 "크레딧 장부"로도 열 수 있어요.</div>
       <label class="checkbox_label"><input class="cl-opt" data-opt="showChip" type="checkbox"> 입력창 위에 요약 줄 보이기</label>
       <label class="checkbox_label"><input class="cl-opt" data-opt="notify" type="checkbox"> 출금 알림 (채팅마다 차감 금액 알림)</label>
+      ${ORIGIN_OPTS_HTML}
       <label class="checkbox_label"><input class="cl-opt" data-opt="autoCalib" type="checkbox"> 자동 보정 (잔액 보정할 때 오차를 배워서 다음 계산에 반영)</label>
     </div>
   </div>
@@ -684,6 +805,7 @@ const WINDOW_HTML = `
     <b>설정</b>
     <label class="checkbox_label"><input class="cl-opt" data-opt="showChip" type="checkbox"> 입력창 위에 요약 줄 보이기</label>
     <label class="checkbox_label"><input class="cl-opt" data-opt="notify" type="checkbox"> 출금 알림 (채팅마다 차감 금액 알림)</label>
+    ${ORIGIN_OPTS_HTML}
     <label class="checkbox_label"><input class="cl-opt" data-opt="autoCalib" type="checkbox"> 자동 보정</label>
   </div>
 </section>`;
@@ -917,7 +1039,7 @@ function renderWallets() {
         if (rem.kind === 'real') sub.push(`조회 ${timeAgo(rem.at)}`);
         if (rem.kind === 'est') sub.push('추정치');
         if (w.real?.unlimited && Number.isFinite(w.real.used)) sub.push(`누적 사용 ${fmt(w.real.used, unit)}`);
-        if (keyLinks(w).length) sub.push(`묶인 키 ${keyLinks(w).length}개`);
+        if (keyLinks(w).length) sub.push(`🔑 ${keyLinks(w).map(id => keyInfo[id]?.label || '지워진 키').join(', ')}`);
         if (aliasHosts(w).length) sub.push(`묶인 주소 ${aliasHosts(w).length}개`);
         if (TYPES[w.type]?.source && !keyLinks(w).length && S.wallets.some(x => x !== w && x.type === w.type)) sub.push('기본 지갑');
         if (!TYPES[w.type]?.lookup && calibFactor(w) !== 1) sub.push(`보정 ×${calibFactor(w).toFixed(2)}`);
@@ -1380,14 +1502,59 @@ async function openEditor(existing, preset) {
     box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
+let summaryBy = 'ext';
+
+function entryValue(e) {
+    if (Number.isFinite(e.cost)) return e.cost;
+    if (e.costSrc === 'group' && Number.isFinite(e.groupCost) && e.groupN) return e.groupCost / e.groupN;
+    return null;
+}
+
+/** This month's spend grouped by where it came from (or by chat). */
+function renderOriginSummary() {
+    const month = dayKey().slice(0, 7);
+    const groups = new Map();
+    for (const e of S.entries) {
+        if (!e.w || dayKey(e.t).slice(0, 7) !== month) continue;
+        const w = S.wallets.find(x => x.id === e.w);
+        if (!w) continue;
+        const label = summaryBy === 'chat' ? (e.chat || '(채팅 밖)') : summaryBy === 'gen' ? (GEN_TYPES[e.gen] || '알 수 없음') : extLabel(e);
+        const unit = walletUnit(w);
+        const k = `${label}|${unit}`;
+        const g = groups.get(k) || { label, unit, n: 0, sum: 0, unknown: 0 };
+        g.n++;
+        const v = entryValue(e);
+        if (v === null) g.unknown++; else g.sum += v;
+        groups.set(k, g);
+    }
+    const sel = el('select', { class: 'text_pole cl-cur' },
+        el('option', { value: 'ext', text: '보낸 곳별', selected: summaryBy === 'ext' }),
+        el('option', { value: 'chat', text: '채팅별', selected: summaryBy === 'chat' }),
+        el('option', { value: 'gen', text: '생성 종류별', selected: summaryBy === 'gen' }));
+    sel.addEventListener('change', () => { summaryBy = sel.value; renderLog(); });
+    const list = [...groups.values()].sort((a, b) => b.sum - a.sum);
+    const tbl = el('table', { class: 'cl-table' },
+        el('tr', {}, ...['사용처', '횟수', '합계'].map(h => el('th', { text: h }))),
+        ...list.map(g => el('tr', {},
+            el('td', { text: g.label }),
+            el('td', { text: String(g.n) }),
+            el('td', { text: `${fmt(g.sum, g.unit)}${g.unknown ? ` (+${g.unknown}회 금액 모름)` : ''}` }))));
+    return el('div', { class: 'cl-card' },
+        el('div', { class: 'cl-row' }, el('b', { text: '이번 달 사용처별 합계' }), sel),
+        list.length ? tbl : el('div', { class: 'cl-note', text: '이번 달 기록이 없어요.' }),
+        el('div', { class: 'cl-note', text: `최근 ${MAX_ENTRIES}건 기록 기준이에요. "보낸 곳"은 요청을 보낸 코드를 거슬러 찾은 거라, 다른 확장을 거쳐 부르면 중간 확장 이름이 나올 수 있어요.` }));
+}
+
 function renderLog() {
     const box = document.getElementById('cl_log');
     if (!box) return;
     box.replaceChildren();
     const rows = S.entries.slice(-100).reverse();
     if (!rows.length) { box.append(el('div', { class: 'cl-note', text: '기록 없음' })); return; }
+    box.append(renderOriginSummary());
+    const today = dayKey();
     const tbl = el('table', { class: 'cl-table' },
-        el('tr', {}, ...['시간', '지갑', '모델', '입력/출력', '비용'].map(h => el('th', { text: h }))));
+        el('tr', {}, ...['시간', '지갑', '사용처', '모델', '입력/출력', '비용'].map(h => el('th', { text: h }))));
     for (const e of rows) {
         const w = S.wallets.find(x => x.id === e.w);
         const tok = `${fmtTok(e.in)} / ${fmtTok(e.out + (e.think || 0))}${e.think ? ` (생각 ${fmtTok(e.think)})` : ''}${e.cached ? ` · 캐시 ${fmtTok(e.cached)}` : ''}${e.est ? ' ≈' : ''}`;
@@ -1395,9 +1562,12 @@ function renderLog() {
             class: 'menu_button cl-mini', text: '지갑 만들기',
             onclick: () => openEditor(null, e.host ? { type: 'newapi', url: `https://${e.host}/v1` } : { type: ({ vertexai: 'vertex', makersuite: 'gemini', deepseek: 'deepseek' })[e.src] || 'manual' }),
         }) : null;
+        const d = new Date(e.t);
+        const time = (dayKey(e.t) === today ? '' : `${d.getMonth() + 1}/${d.getDate()} `) + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
         tbl.append(el('tr', {},
-            el('td', { text: new Date(e.t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }),
-            el('td', {}, w ? document.createTextNode(w.name) : el('span', { class: 'cl-warn-text', text: e.host || e.src }), addBtn),
+            el('td', { text: time }),
+            el('td', {}, w ? document.createTextNode(w.name) : el('span', { class: 'cl-warn-text', text: e.host ? maskHost(e.host) : e.src }), addBtn),
+            el('td', { text: originText(e, { ...S, showModel: false }) || '—' }),
             el('td', { text: e.model, class: 'cl-model' }),
             el('td', { text: tok }),
             el('td', { text: entryCostText(e, w) })));
@@ -1498,8 +1668,10 @@ function mountPanel() {
         };
         if (document.getElementById('extensions_settings')) start();
         eventSource.on(event_types.APP_READY, start);
-        refreshActiveKeys();
+        refreshActiveKeys().then(() => renderAll());
         eventSource.on(event_types.APP_READY, refreshActiveKeys);
+        eventSource.on(event_types.GENERATION_STARTED, onGenStarted);
+        for (const ev of ['GENERATION_ENDED', 'GENERATION_STOPPED']) if (event_types[ev]) eventSource.on(event_types[ev], onGenEnded);
         for (const ev of ['SECRET_WRITTEN', 'SECRET_DELETED', 'SECRET_ROTATED', 'SECRET_EDITED']) {
             if (event_types[ev]) eventSource.on(event_types[ev], () => { refreshActiveKeys().then(() => { if (windowPopup) renderLinks(); }); });
         }

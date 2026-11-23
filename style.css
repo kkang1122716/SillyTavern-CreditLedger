@@ -37,6 +37,8 @@
 .cl-root .cl-link-row > div { min-width: 12em; flex: 1; }
 .cl-root .cl-link-row select { width: auto; max-width: 100%; margin: 0; flex: 1 1 14em; }
 .cl-root h4 { margin: 10px 0 4px; }
+.cl-root .cl-subopts { margin: 2px 0 6px 22px; padding-left: 8px; border-left: 2px solid var(--SmartThemeBorderColor); }
+.toast.cl-bank-toast small { opacity: 0.9; }
 .cl-root .cl-section { margin: 8px 0; }
 .cl-root .cl-section summary { cursor: pointer; font-weight: bold; }
 .cl-root .cl-table { width: 100%; border-collapse: collapse; font-size: 0.8em; margin-top: 4px; }
