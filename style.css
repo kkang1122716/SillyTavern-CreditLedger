@@ -69,3 +69,18 @@
 .cl-root [hidden] { display: none !important; }
 .cl-root .cl-who { color: var(--warning, #e8a33d); border-color: var(--warning, #e8a33d); }
 .cl-root .cl-table .cl-mini { white-space: nowrap; width: auto; display: inline-block; margin: 2px 0 0; }
+
+/* --- period filter + totals (1.1.2) --- */
+.cl-root .cl-date { width: auto; margin: 0; padding: 2px 6px; }
+.cl-root .cl-totals { margin-top: 6px; display: flex; flex-direction: column; gap: 2px; }
+.cl-root .cl-total-line { font-size: 0.9em; }
+.cl-root .cl-total-sel { color: var(--SmartThemeQuoteColor); }
+.cl-root .cl-period-spend { opacity: 0.85; }
+.cl-root .cl-table th.cl-pick, .cl-root .cl-table td.cl-pick { width: 1.6em; text-align: center; padding-right: 0; }
+.cl-root .cl-table td.cl-pick input, .cl-root .cl-table th.cl-pick input { margin: 0; cursor: pointer; }
+.cl-root .cl-table tr.cl-picked { background: color-mix(in srgb, var(--SmartThemeQuoteColor) 16%, transparent); }
+.cl-root .cl-bar { height: 8px; border-radius: 4px; background: rgba(127,127,127,0.25); overflow: hidden; margin: 2px 0 6px; }
+.cl-root .cl-bar-fill { height: 100%; background: #3fa37c; }
+.cl-root .cl-bar-fill.cl-bar-warn { background: var(--warning, #e8a33d); }
+.cl-root .cl-bar-fill.cl-bar-over { background: #d9534f; }
+.cl-report .cl-table th { white-space: nowrap; }

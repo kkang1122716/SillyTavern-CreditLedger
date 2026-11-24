@@ -12,6 +12,7 @@ const PLUGIN = '/api/plugins/credit-ledger';
 const GEN_PATH = '/api/backends/chat-completions/generate';
 const MAX_ENTRIES = 800;
 const DAILY_KEEP_DAYS = 62;
+const LOG_ROWS = 200;
 const AUTO_DELAY_MS = 10_000;
 const AUTO_MIN_GAP_MS = 60_000;
 
@@ -59,6 +60,10 @@ const defaultSettings = Object.freeze({
     entries: [],
     unpriced: [],
     originRules: [],
+    budgetCur: '₩',
+    budgetDay: 0,
+    budgetMonth: 0,
+    budgetFlags: {},
 });
 
 const ctx = () => SillyTavern.getContext();
@@ -579,7 +584,7 @@ function originText(e, opts = S) {
     const parts = [];
     if (opts.showChat && e.chat) parts.push(`💬 ${e.chat}`);
     if (opts.showExt) parts.push(extLabel(e));
-    if (opts.showGen && e.gen) parts.push(GEN_TYPES[e.gen] || e.gen);
+    if (opts.showGen && e.gen) parts.push(e.direct ? '🌐 외부 API 직접 호출' : (GEN_TYPES[e.gen] || e.gen));
     if (opts.showModel && e.model) parts.push(e.model);
     return parts.join(' · ');
 }
@@ -659,9 +664,71 @@ function costFromTokens(model, u, t = Date.now()) {
 
 // ------------------------------------------------------------ capture
 
+// AI endpoints an extension may call directly from the browser, bypassing ST.
+const DIRECT_PATHS = [
+    /\/chat\/completions\/?$/i,
+    /\/v1\/messages\/?$/i,
+    /\/models\/[^/?:]+:(stream)?generatecontent\/?$/i,
+];
+const DIRECT_SOURCE = {
+    'generativelanguage.googleapis.com': 'makersuite',
+    'aiplatform.googleapis.com': 'vertexai',
+    'api.deepseek.com': 'deepseek',
+};
+
+/** Text of a request body in any of the common formats (for token estimates). */
+function promptTextOf(body) {
+    const parts = [];
+    const sys = body.system ?? body.systemInstruction ?? body.system_instruction;
+    if (typeof sys === 'string') parts.push(sys);
+    else if (Array.isArray(sys)) parts.push(sys.map(p => typeof p === 'string' ? p : p?.text || '').join('\n'));
+    else if (Array.isArray(sys?.parts)) parts.push(sys.parts.map(p => p?.text || '').join('\n'));
+    if (Array.isArray(body.messages)) parts.push(textOfMessages(body.messages));
+    if (Array.isArray(body.contents)) parts.push(body.contents.map(c => (c?.parts || []).map(p => p?.text || '').join('\n')).join('\n'));
+    if (typeof body.prompt === 'string') parts.push(body.prompt);
+    else if (Array.isArray(body.prompt)) parts.push(textOfMessages(body.prompt));
+    return parts.join('\n');
+}
+
+/** A generation request an extension sends straight to an AI service (or ST's text-completion endpoint). */
+function inspectDirect(url, init) {
+    if (String(init?.method || 'GET').toUpperCase() !== 'POST' || typeof init?.body !== 'string') return null;
+    let u;
+    try { u = new URL(String(url), location.origin); } catch { return null; }
+    const same = u.origin === location.origin;
+    let source;
+    let host = '';
+    if (same) {
+        if (!u.pathname.includes('/api/backends/text-completions/generate')) return null;
+        source = 'textgen';
+    } else {
+        if (!DIRECT_PATHS.some(rx => rx.test(u.pathname))) return null;
+        host = u.host.toLowerCase();
+        source = DIRECT_SOURCE[host] || 'direct';
+    }
+    let body;
+    try { body = JSON.parse(init.body); } catch { return null; }
+    if (same) host = hostOf(body.api_server || '');
+    const model = String(body.model || /\/models\/([^/?:]+):/i.exec(u.pathname)?.[1] || '');
+    let origin = {};
+    try { probeWrappers(); } catch { /* */ }
+    try { origin = captureOrigin(); } catch { /* */ }
+    // ST's own generation never goes out this way, so it can't be "the chat".
+    origin.gen = 'raw';
+    origin.genRef = null;
+    let fp = null;
+    try { fp = fingerprint(body, origin.route); } catch { /* */ }
+    return {
+        source, model, host, viaProxy: false, keyId: '', origin, fp, direct: true,
+        stream: !!body.stream || /streamgeneratecontent/i.test(u.pathname),
+        messages: body.messages, promptText: promptTextOf(body), t: Date.now(),
+    };
+}
+
 function inspectRequest(input, init) {
     const url = typeof input === 'string' ? input : input?.url;
-    if (!url || !String(url).includes(GEN_PATH)) return null;
+    if (!url) return null;
+    if (!String(url).includes(GEN_PATH)) return inspectDirect(url, init);
     if (typeof init?.body !== 'string') return null;
     const body = JSON.parse(init.body);
     const source = String(body.chat_completion_source || '');
@@ -718,7 +785,18 @@ async function estimateUsage(meta, outText) {
     const count = async (s) => {
         try { return await c.getTokenCountAsync(s); } catch { return Math.ceil(String(s).length / 3); }
     };
-    return { in: await count(textOfMessages(meta.messages)), out: await count(outText || ''), think: 0, cached: 0 };
+    return { in: await count(meta.promptText ?? textOfMessages(meta.messages)), out: await count(outText || ''), think: 0, cached: 0 };
+}
+
+/** Usage arrives in pieces (Anthropic) or cumulatively (Gemini): keep the largest of each. */
+function mergeUsage(a, b) {
+    if (!a) return { ...b };
+    return {
+        in: Math.max(a.in || 0, b.in || 0),
+        out: Math.max(a.out || 0, b.out || 0),
+        think: Math.max(a.think || 0, b.think || 0),
+        cached: Math.max(a.cached || 0, b.cached || 0),
+    };
 }
 
 async function handleResponse(meta, res) {
@@ -737,7 +815,9 @@ async function handleResponse(meta, res) {
             if (!data || data === '[DONE]') return;
             let o;
             try { o = JSON.parse(data); } catch { return; }
-            usage = readGeminiUsage(o) || readOpenAiUsage(o) || usage;
+            const u = readGeminiUsage(o) || readOpenAiUsage(o) || readOpenAiUsage(o?.message);
+            if (u) usage = mergeUsage(usage, u);
+            if (o?.type === 'content_block_delta' && typeof o.delta?.text === 'string') outText += o.delta.text;
             const parts = o?.candidates?.[0]?.content?.parts;
             if (Array.isArray(parts)) outText += parts.filter(p => !p.thought).map(p => p.text || '').join('');
             const delta = o?.choices?.[0]?.delta?.content;
@@ -762,8 +842,15 @@ async function handleResponse(meta, res) {
         let j = null;
         try { j = await res.json(); } catch { return; }
         if (j?.error) return;
-        usage = readGeminiUsage(j) || readOpenAiUsage(j);
-        outText = j?.choices?.[0]?.message?.content || '';
+        const list = Array.isArray(j) ? j : [j];
+        for (const o of list) {
+            const u = readGeminiUsage(o) || readOpenAiUsage(o);
+            if (u) usage = mergeUsage(usage, u);
+            const parts = o?.candidates?.[0]?.content?.parts;
+            if (Array.isArray(parts)) outText += parts.filter(p => !p.thought).map(p => p.text || '').join('');
+            if (Array.isArray(o?.content)) outText += o.content.map(p => p?.text || '').join('');
+        }
+        outText ||= j?.choices?.[0]?.message?.content || '';
     }
     let estimated = false;
     if (!usage) {
@@ -808,6 +895,191 @@ function notifyWithdraw(w, amount, entries = []) {
     } catch { /* ignore */ }
 }
 
+// ------------------------------------------------------------ pre-send estimate
+//
+// Builds the next prompt the way ST would (a "dry run": nothing is sent), counts
+// its tokens locally, and prices it with this model's recent averages for
+// output, thinking and cache hits.
+
+let estimating = false;
+
+async function buildNextPrompt() {
+    const c = ctx();
+    const { eventSource, event_types } = c;
+    let data = null;
+    const grab = (d, dryRun) => { if (dryRun && d) data = d; };
+    eventSource.on(event_types.GENERATE_AFTER_DATA, grab);
+    try {
+        await c.generate('normal', {}, true);
+    } finally {
+        eventSource.removeListener(event_types.GENERATE_AFTER_DATA, grab);
+    }
+    return data;
+}
+
+function recentChatStats(model) {
+    const chatGens = ['normal', 'swipe', 'regenerate', 'continue'];
+    const pick = (same) => S.entries.filter(e => chatGens.includes(e.gen) && !e.direct && (!same || e.model === model)).slice(-20);
+    let list = pick(true);
+    const sameModel = list.length > 0;
+    if (!list.length) list = pick(false);
+    const exact = list.filter(e => !e.est);
+    const avg = (arr, f) => arr.length ? arr.reduce((a, e) => a + f(e), 0) / arr.length : 0;
+    return {
+        n: list.length,
+        sameModel,
+        out: Math.round(avg(list, e => e.out || 0)),
+        think: Math.round(avg(exact, e => e.think || 0)),
+        cacheRatio: exact.length ? Math.min(0.99, avg(exact.filter(e => e.in > 0), e => (e.cached || 0) / e.in)) : 0,
+    };
+}
+
+async function estimateNext() {
+    const c = ctx();
+    if (estimating) return;
+    if (c.mainApi && c.mainApi !== 'openai') { toastr.info('지금은 Chat Completion 연결에서만 계산할 수 있어요.', '💳 크레딧 장부'); return; }
+    if (currentGen && !currentGen.used) { toastr.info('생성 중이에요. 끝난 뒤에 다시 눌러주세요.', '💳 크레딧 장부'); return; }
+    if (c.characterId === undefined && !c.groupId) { toastr.info('채팅을 먼저 열어주세요.', '💳 크레딧 장부'); return; }
+    estimating = true;
+    const busy = toastr.info('프롬프트를 만들어 토큰을 세는 중… (AI는 부르지 않아요)', '🧮 비용 계산', { timeOut: 0 });
+    try {
+        const data = await buildNextPrompt();
+        if (!data) throw new Error('프롬프트를 만들지 못했어요.');
+        const typed = String(document.getElementById('send_textarea')?.value || '');
+        const count = async (t) => { try { return await c.getTokenCountAsync(t); } catch { return Math.ceil(t.length / 3); } };
+        const inTok = await count(promptTextOf(data) + (typed ? `\n${typed}` : ''));
+        const model = String(data.model || c.getChatCompletionModel?.() || '');
+        const st = recentChatStats(model);
+        const maxOut = Number(data.max_tokens ?? data.max_completion_tokens ?? c.chatCompletionSettings?.openai_max_tokens) || 0;
+        const outTyp = st.out || Math.min(maxOut || 1000, 1000);
+        // The dry run's data has no connection details; take them from the API settings.
+        const conn = { ...(c.chatCompletionSettings || {}), ...data };
+        const source = String(conn.chat_completion_source || '');
+        const viaProxy = !!conn.reverse_proxy;
+        let host = '';
+        if (source === 'custom') host = hostOf(conn.custom_url);
+        else if (viaProxy) host = hostOf(conn.reverse_proxy);
+        const slot = viaProxy ? '' : keySlotFor(conn);
+        const w = walletFor({ source, host, viaProxy, keyId: slot ? (conn.secret_id || activeKeys[slot] || '') : '' });
+        const typical = costFromTokens(model, { in: inTok, out: outTyp, think: st.think, cached: Math.round(inTok * st.cacheRatio) });
+        const maxAll = Math.max(maxOut, outTyp);
+        const worst = costFromTokens(model, { in: inTok, out: maxAll, think: st.think, cached: 0 });
+        showEstimate({ model, inTok, typed: !!typed, st, outTyp, maxOut: maxAll, typical, worst, w });
+    } catch (e) {
+        toastr.error(String(e?.message || e), '🧮 비용 계산');
+    } finally {
+        estimating = false;
+        try { toastr.clear(busy); } catch { /* */ }
+    }
+}
+
+function showEstimate(r) {
+    const { w, st } = r;
+    const lookup = w && TYPES[w.type]?.lookup;
+    const unit = w && !lookup ? walletUnit(w) : '$';
+    const k = w && !lookup ? unitRate(w) * calibFactor(w) : 1;
+    const money = (usd) => usd === null ? '단가 없음' : fmt(usd * k, unit);
+    const rows = [
+        ['모델', r.model || '알 수 없음'],
+        ['지갑', w ? w.name : '연결된 지갑 없음'],
+        ['보낼 입력', `${r.inTok.toLocaleString()} 토큰${r.typed ? ' (입력창 글 포함)' : ''}`],
+        ['예상 출력', `${r.outTyp.toLocaleString()} 토큰${st.think ? ` + 생각 ${st.think.toLocaleString()}` : ''}${st.n ? ` (최근 ${st.n}회 평균${st.sameModel ? '' : ', 다른 모델 포함'})` : ' (기록이 없어 대충 잡은 값)'}`],
+        ['캐시 적중', st.cacheRatio ? `약 ${Math.round(st.cacheRatio * 100)}% (최근 기록 기준)` : '없음으로 계산'],
+    ];
+    const box = el('div', { class: 'cl-root cl-report' },
+        el('h3', { text: '🧮 지금 보내면' }),
+        el('div', { class: 'cl-big', text: `약 ${money(r.typical)}` }),
+        el('div', { class: 'cl-sub', text: `최대 ${money(r.worst)} (캐시 없이 출력을 끝까지 다 쓸 때${r.maxOut ? `: ${r.maxOut.toLocaleString()} 토큰` : ''})` }),
+        el('table', { class: 'cl-table' }, ...rows.map(([a, b]) => el('tr', {}, el('th', { text: a }), el('td', { text: b })))),
+        el('div', { class: 'cl-note', text: '스와이프·재생성도 한 번에 거의 같은 금액이에요. AI를 부르지 않고 실리태번이 만들 프롬프트를 미리 조립해서 세기만 했어요.' }),
+        lookup ? el('div', { class: 'cl-note', text: '이 지갑은 잔액 조회형이라 달러 단가로만 보여줘요. 실제 차감은 프록시 요금제를 따라요.' }) : null,
+        r.typical === null ? el('div', { class: 'cl-note cl-warn-text', text: '단가표에 이 모델이 없어요. "단가표" 탭에서 추가하면 금액이 나와요.' }) : null);
+    const rem = w && !lookup ? remainingOf(w) : null;
+    if (rem?.value !== null && rem?.value !== undefined && r.typical) {
+        const times = Math.floor(rem.value / (r.typical * k));
+        box.append(el('div', { class: 'cl-note', text: `남은 잔액 ${fmt(rem.value, unit)} → 이대로면 약 ${times.toLocaleString()}번 더 보낼 수 있어요.` }));
+    }
+    const { Popup, POPUP_TYPE } = ctx();
+    new Popup(box, POPUP_TYPE.TEXT, '', { okButton: '닫기', allowVerticalScrolling: true }).show();
+}
+
+// ------------------------------------------------------------ budget
+
+/** Units of the wallet's currency per 1 USD. */
+function unitRate(w) {
+    if (Number.isFinite(w?.rate) && w.rate > 0) return w.rate;
+    return CURRENCIES.find(c => c.sym === walletUnit(w))?.rate || 1;
+}
+
+/** Units of the budget currency per 1 USD: a wallet's own rate if one uses it, else the default. */
+function budgetRate() {
+    const cur = S.budgetCur || '₩';
+    const w = S.wallets.find(x => walletUnit(x) === cur && Number.isFinite(x.rate) && x.rate > 0);
+    return w ? w.rate : (CURRENCIES.find(c => c.sym === cur)?.rate || 1);
+}
+
+/** Spend across all wallets today / this month, in the budget currency. */
+function budgetSpend() {
+    let today = 0;
+    let month = 0;
+    for (const w of S.wallets) {
+        const st = spendStats(w);
+        const k = budgetRate() / unitRate(w);
+        today += st.today * k;
+        month += st.month * k;
+    }
+    return { today, month };
+}
+
+function checkBudget() {
+    if (!(S.budgetDay > 0) && !(S.budgetMonth > 0)) return;
+    const sp = budgetSpend();
+    const day = dayKey();
+    const cur = S.budgetCur || '₩';
+    const flags = S.budgetFlags || (S.budgetFlags = {});
+    for (const k of Object.keys(flags)) if (!k.includes(day) && !k.includes(`m:${day.slice(0, 7)}`)) delete flags[k];
+    const check = (limit, spent, label, key) => {
+        if (!(limit > 0)) return;
+        const pct = spent / limit * 100;
+        for (const th of [100, 80]) {
+            if (pct < th) continue;
+            const f = `${key}:${th}`;
+            if (flags[f]) break;
+            flags[f] = true;
+            if (th === 80 && flags[`${key}:100`]) break;
+            const msg = `${label} ${fmt(spent, cur)} / ${fmt(limit, cur)} (${Math.round(pct)}%)`;
+            if (th >= 100) toastr.error(`${msg}<br><small>예산을 넘었어요.</small>`, '💳 예산 초과', { timeOut: 10000, escapeHtml: false });
+            else toastr.warning(`${msg}<br><small>예산의 80%를 썼어요.</small>`, '💳 예산 경고', { timeOut: 8000, escapeHtml: false });
+            save();
+            break;
+        }
+    };
+    check(S.budgetDay, sp.today, '오늘', `d:${day}`);
+    check(S.budgetMonth, sp.month, '이번 달', `m:${day.slice(0, 7)}`);
+}
+
+function renderBudget() {
+    const box = document.getElementById('cl_budget');
+    if (!box) return;
+    box.replaceChildren();
+    if (!(S.budgetDay > 0) && !(S.budgetMonth > 0)) return;
+    const sp = budgetSpend();
+    const cur = S.budgetCur || '₩';
+    const bar = (label, spent, limit) => {
+        if (!(limit > 0)) return null;
+        const pct = spent / limit * 100;
+        const cls = pct >= 100 ? 'cl-bar-over' : pct >= 80 ? 'cl-bar-warn' : '';
+        return el('div', { class: 'cl-budget-row' },
+            el('div', { class: 'cl-sub', text: `${label} ${fmt(spent, cur)} / ${fmt(limit, cur)} (${Math.round(pct)}%)` }),
+            el('div', { class: 'cl-bar' }, el('div', { class: `cl-bar-fill ${cls}`, style: `width:${Math.min(100, pct).toFixed(1)}%` })));
+    };
+    box.append(el('div', { class: 'cl-card' },
+        el('b', { text: '예산' }),
+        bar('오늘', sp.today, S.budgetDay),
+        bar('이번 달', sp.month, S.budgetMonth),
+        el('div', { class: 'cl-note', text: '모든 지갑 합계예요. 다른 화폐 지갑은 환율로 바꿔서 더해요.' })));
+}
+
 function record(meta, usage, estimated) {
     const w = walletFor(meta);
     const lookup = w && TYPES[w.type]?.lookup;
@@ -832,6 +1104,7 @@ function record(meta, usage, estimated) {
         tokenCost,
     };
     if (meta.fp) entry.fp = meta.fp;
+    if (meta.direct) entry.direct = true;
     if (!entry.ext && meta.fp) {
         const rule = findRule(entry.gen, entry.model, meta.fp);
         if (rule) { entry.ext = rule.ext; entry.extBy = 'rule'; rule.hits = (rule.hits || 0) + 1; rule.last = now; }
@@ -850,6 +1123,7 @@ function record(meta, usage, estimated) {
     if (w && lookup && w.auto !== false && pluginOk) scheduleRefresh(w, AUTO_DELAY_MS);
     renderAll();
     if (w && !lookup && entry.cost) notifyWithdraw(w, entry.cost, [entry]);
+    checkBudget();
 }
 
 function installFetchHook() {
@@ -961,6 +1235,7 @@ function applyBalance(w, r) {
             w.lastDelta = { amount: delta, calls: pending.length, at: next.at };
             w.real = next;
             notifyWithdraw(w, delta, pending);
+            checkBudget();
             return;
         }
     } else if (!prev) {
@@ -1063,9 +1338,11 @@ const WINDOW_HTML = `
   <div class="cl-row">
     <button id="cl_import" class="menu_button">＋ 연결 프로필에서 한 번에 가져오기</button>
     <button id="cl_add_current" class="menu_button">＋ 지금 연결된 API로 추가</button>
+    <button class="menu_button cl-estimate-btn">🧮 보내기 전 비용 계산</button>
     <button id="cl_add" class="menu_button">＋ 직접 추가</button>
   </div>
   <div id="cl_editor" class="cl-editor" hidden></div>
+  <div id="cl_budget"></div>
   <div id="cl_wallets" class="cl-grid"></div>
 </section>
 <section data-pane="links" hidden>
@@ -1097,6 +1374,18 @@ const WINDOW_HTML = `
     ${ORIGIN_OPTS_HTML}
     <label class="checkbox_label"><input class="cl-opt" data-opt="autoCalib" type="checkbox"> 자동 보정</label>
   </div>
+  <div class="cl-section">
+    <b>예산</b>
+    <div class="cl-note">모든 지갑을 합쳐서 80%·100%가 되면 알려줘요. 0이면 꺼져요.</div>
+    <div class="cl-row">
+      <span>화폐</span>
+      <select id="cl_budget_cur" class="text_pole cl-cur">
+        <option value="₩">원 (₩)</option><option value="$">달러 ($)</option><option value="円">엔 (円)</option><option value="¥">위안 (¥)</option>
+      </select>
+    </div>
+    <div class="cl-row"><span>하루</span><input id="cl_budget_day" class="text_pole cl-rate" type="number" min="0" step="any"></div>
+    <div class="cl-row"><span>한 달</span><input id="cl_budget_month" class="text_pole cl-rate" type="number" min="0" step="any"></div>
+  </div>
 </section>`;
 
 let windowPopup = null;
@@ -1105,6 +1394,26 @@ try { currentTab = localStorage.getItem('cl_tab') || 'wallets'; } catch { /* */ 
 
 function syncOptions() {
     document.querySelectorAll('.cl-opt').forEach(i => { i.checked = !!S[i.dataset.opt]; });
+}
+
+function bindBudget(root) {
+    const cur = root.querySelector('#cl_budget_cur');
+    const day = root.querySelector('#cl_budget_day');
+    const month = root.querySelector('#cl_budget_month');
+    if (!cur) return;
+    cur.value = S.budgetCur || '₩';
+    day.value = S.budgetDay || 0;
+    month.value = S.budgetMonth || 0;
+    const apply = () => {
+        S.budgetCur = cur.value;
+        S.budgetDay = Math.max(0, Number(day.value) || 0);
+        S.budgetMonth = Math.max(0, Number(month.value) || 0);
+        S.budgetFlags = {};
+        save();
+        renderBudget();
+        checkBudget();
+    };
+    for (const i of [cur, day, month]) i.addEventListener('change', apply);
 }
 
 function bindOptions(root) {
@@ -1252,6 +1561,8 @@ function openWindow(tab) {
         renderPrices();
     });
     bindOptions(root);
+    bindBudget(root);
+    root.querySelectorAll('.cl-estimate-btn').forEach(b => b.addEventListener('click', () => estimateNext()));
     windowPopup = new Popup(root, POPUP_TYPE.DISPLAY, null, {
         wide: true, large: true, allowVerticalScrolling: true, leftAlign: true,
         onClose: () => { windowPopup = null; },
@@ -1315,6 +1626,7 @@ function renderWallets() {
     const box = document.getElementById('cl_wallets');
     if (!box) return;
     box.replaceChildren();
+    box.append(el('div', { class: 'cl-card' }, periodBar(renderAll)));
     if (!S.wallets.length) {
         box.append(el('div', { class: 'cl-note', text: '아직 지갑이 없어요. "지금 연결된 API로 추가"를 누르면 편해요.' }));
     }
@@ -1342,6 +1654,7 @@ function renderWallets() {
             el('div', { class: 'cl-big', text: remText }),
             sub.length ? el('div', { class: 'cl-sub', text: sub.join(' · ') }) : null,
             el('div', { class: 'cl-sub', text: `오늘 ${fmt(st.today, unit)} · 이번 달 ${fmt(st.month, unit)}` }),
+            el('div', { class: 'cl-sub cl-period-spend', text: `${periodLabel()} 사용 ${fmt(periodSpend(w), unit)}` }),
             w.lastError ? el('div', { class: 'cl-sub cl-warn-text', text: `⚠️ ${w.lastError}` }) : null,
             el('div', { class: 'cl-row' },
                 TYPES[w.type]?.lookup ? el('button', {
@@ -1794,6 +2107,112 @@ async function openEditor(existing, preset) {
 
 let summaryBy = 'ext';
 
+// ------------------------------------------------------- period filtering
+
+let period = 'month';   // today | yest | d7 | d30 | month | lastmonth | all | custom
+let customFrom = '';
+let customTo = '';
+/** Entry ids ticked in the log table, for the "selected" subtotal. */
+const picked = new Set();
+
+const PERIODS = [
+    ['today', '오늘'],
+    ['yest', '어제'],
+    ['d7', '최근 7일'],
+    ['d30', '최근 30일'],
+    ['month', '이번 달'],
+    ['lastmonth', '지난달'],
+    ['all', '전체'],
+    ['custom', '직접 고르기'],
+];
+
+function shiftDay(n) {
+    const d = new Date();
+    d.setDate(d.getDate() + n);
+    return dayKey(d.getTime());
+}
+
+/** Inclusive day-key range for the chosen period; null on a side means open. */
+function periodRange() {
+    const today = dayKey();
+    switch (period) {
+        case 'today': return { from: today, to: today };
+        case 'yest': return { from: shiftDay(-1), to: shiftDay(-1) };
+        case 'd7': return { from: shiftDay(-6), to: today };
+        case 'd30': return { from: shiftDay(-29), to: today };
+        case 'month': return { from: today.slice(0, 7) + '-01', to: today };
+        case 'lastmonth': {
+            const now = new Date();
+            const first = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+            const last = new Date(now.getFullYear(), now.getMonth(), 0);
+            return { from: dayKey(first.getTime()), to: dayKey(last.getTime()) };
+        }
+        case 'custom': return { from: customFrom || null, to: customTo || null };
+        default: return { from: null, to: null };
+    }
+}
+
+function inPeriod(t) {
+    const { from, to } = periodRange();
+    const k = dayKey(t);
+    return (!from || k >= from) && (!to || k <= to);
+}
+
+function periodLabel() {
+    if (period !== 'custom') return (PERIODS.find(p => p[0] === period) || [])[1] || '';
+    const { from, to } = periodRange();
+    if (!from && !to) return '전체';
+    return (from || '처음') + ' ~ ' + (to || '오늘');
+}
+
+const periodEntries = () => S.entries.filter(e => inPeriod(e.t));
+
+/** Wallets can hold different currencies, so totals stay separated per unit. */
+function sumByUnit(entries) {
+    const byUnit = new Map();
+    let unknown = 0;
+    for (const e of entries) {
+        const w = S.wallets.find(x => x.id === e.w);
+        const unit = w ? walletUnit(w) : '$';
+        const v = entryValue(e);
+        if (v === null) { unknown++; continue; }
+        byUnit.set(unit, (byUnit.get(unit) || 0) + v);
+    }
+    return { byUnit, unknown, n: entries.length };
+}
+
+function sumText(s) {
+    const parts = [...s.byUnit.entries()].map(([unit, v]) => fmt(v, unit));
+    if (!parts.length) parts.push(fmt(0));
+    return parts.join(' · ') + ' — ' + s.n + '건' + (s.unknown ? ', 금액 모름 ' + s.unknown + '건' : '');
+}
+
+/** Per-wallet spend across the chosen period, taken from the daily totals. */
+function periodSpend(w) {
+    const { from, to } = periodRange();
+    let sum = 0;
+    for (const [k, v] of Object.entries(w.daily || {})) {
+        if ((from && k < from) || (to && k > to)) continue;
+        sum += v;
+    }
+    return sum;
+}
+
+function periodBar(onChange) {
+    const sel = el('select', { class: 'text_pole cl-cur' },
+        ...PERIODS.map(([v, t]) => el('option', { value: v, text: t, selected: period === v })));
+    sel.addEventListener('change', () => { period = sel.value; onChange(); });
+    const row = el('div', { class: 'cl-row' }, el('b', { text: '기간' }), sel);
+    if (period === 'custom') {
+        const a = el('input', { type: 'date', class: 'text_pole cl-date', value: customFrom });
+        const b = el('input', { type: 'date', class: 'text_pole cl-date', value: customTo });
+        a.addEventListener('change', () => { customFrom = a.value; onChange(); });
+        b.addEventListener('change', () => { customTo = b.value; onChange(); });
+        row.append(a, el('span', { text: '~' }), b);
+    }
+    return row;
+}
+
 function entryValue(e) {
     if (Number.isFinite(e.cost)) return e.cost;
     if (e.costSrc === 'group' && Number.isFinite(e.groupCost) && e.groupN) return e.groupCost / e.groupN;
@@ -1801,11 +2220,11 @@ function entryValue(e) {
 }
 
 /** This month's spend grouped by where it came from (or by chat). */
+/** Spend over the chosen period, grouped by where it came from (or by chat). */
 function renderOriginSummary() {
-    const month = dayKey().slice(0, 7);
     const groups = new Map();
-    for (const e of S.entries) {
-        if (!e.w || dayKey(e.t).slice(0, 7) !== month) continue;
+    for (const e of periodEntries()) {
+        if (!e.w) continue;
         const w = S.wallets.find(x => x.id === e.w);
         if (!w) continue;
         const label = summaryBy === 'chat' ? (e.chat || '(채팅 밖)') : summaryBy === 'gen' ? (GEN_TYPES[e.gen] || '알 수 없음') : extLabel(e);
@@ -1830,11 +2249,10 @@ function renderOriginSummary() {
             el('td', { text: String(g.n) }),
             el('td', { text: `${fmt(g.sum, g.unit)}${g.unknown ? ` (+${g.unknown}회 금액 모름)` : ''}` }))));
     return el('div', { class: 'cl-card' },
-        el('div', { class: 'cl-row' }, el('b', { text: '이번 달 사용처별 합계' }), sel),
-        list.length ? tbl : el('div', { class: 'cl-note', text: '이번 달 기록이 없어요.' }),
+        el('div', { class: 'cl-row' }, el('b', { text: `${periodLabel()} 사용처별 합계` }), sel),
+        list.length ? tbl : el('div', { class: 'cl-note', text: `${periodLabel()} 기록이 없어요.` }),
         el('div', { class: 'cl-note', text: `최근 ${MAX_ENTRIES}건 기록 기준이에요. "보낸 곳"은 요청을 보낸 코드를 거슬러 찾은 거라, 다른 확장을 거쳐 부르면 중간 확장 이름이 나올 수 있어요.` }));
 }
-
 function isUnknown(e) {
     return !e.ext && !!e.gen && !['normal', 'swipe', 'regenerate', 'continue', 'impersonate'].includes(e.gen);
 }
@@ -1891,16 +2309,57 @@ function renderWho() {
     box.append(card, renderRules());
 }
 
+let totalsBox = null;
+
+/** Grand total for the period, plus the subtotal of whatever is ticked. */
+function refreshTotals() {
+    if (!totalsBox) return;
+    const all = periodEntries();
+    const mine = all.filter(e => picked.has(e.id));
+    const clear = mine.length ? el('button', {
+        class: 'menu_button cl-mini', text: '선택 해제',
+        onclick: () => { picked.clear(); renderLog(); },
+    }) : null;
+    totalsBox.replaceChildren(
+        el('div', { class: 'cl-total-line' },
+            el('b', { text: `${periodLabel()} 전체 합계: ` }),
+            document.createTextNode(sumText(sumByUnit(all)))),
+        el('div', { class: `cl-total-line${mine.length ? ' cl-total-sel' : ' cl-note'}` },
+            el('b', { text: '선택 합계: ' }),
+            document.createTextNode(mine.length ? sumText(sumByUnit(mine)) : '아래 표에서 체크한 것만 따로 더해요.'),
+            clear ? document.createTextNode(' ') : null,
+            clear));
+}
+
 function renderLog() {
     const box = document.getElementById('cl_log');
     if (!box) return;
     box.replaceChildren();
-    const rows = S.entries.slice(-100).reverse();
-    if (!rows.length) { box.append(el('div', { class: 'cl-note', text: '기록 없음' })); return; }
+
+    totalsBox = el('div', { class: 'cl-totals' });
+    box.append(el('div', { class: 'cl-card' }, periodBar(renderLog), totalsBox));
+    refreshTotals();
+
     box.append(renderOriginSummary());
+
+    const inRange = periodEntries();
+    const rows = inRange.slice(-LOG_ROWS).reverse();
+    if (!rows.length) {
+        box.append(el('div', { class: 'cl-note', text: `${periodLabel()} 기록이 없어요.` }));
+        return;
+    }
+
+    const allBox = el('input', { type: 'checkbox', title: '보이는 줄 전체 선택' });
+    allBox.checked = rows.every(e => picked.has(e.id));
+    allBox.addEventListener('change', () => {
+        for (const e of rows) { if (allBox.checked) picked.add(e.id); else picked.delete(e.id); }
+        renderLog();
+    });
+
     const today = dayKey();
     const tbl = el('table', { class: 'cl-table' },
-        el('tr', {}, ...['시간', '지갑', '사용처', '모델', '입력/출력', '비용'].map(h => el('th', { text: h }))));
+        el('tr', {}, el('th', { class: 'cl-pick' }, allBox),
+            ...['시간', '지갑', '사용처', '모델', '입력/출력', '비용'].map(h => el('th', { text: h }))));
     for (const e of rows) {
         const w = S.wallets.find(x => x.id === e.w);
         const tok = `${fmtTok(e.in)} / ${fmtTok(e.out + (e.think || 0))}${e.think ? ` (생각 ${fmtTok(e.think)})` : ''}${e.cached ? ` · 캐시 ${fmtTok(e.cached)}` : ''}${e.est ? ' ≈' : ''}`;
@@ -1910,7 +2369,16 @@ function renderLog() {
         }) : null;
         const d = new Date(e.t);
         const time = (dayKey(e.t) === today ? '' : `${d.getMonth() + 1}/${d.getDate()} `) + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-        tbl.append(el('tr', {},
+        const cb = el('input', { type: 'checkbox' });
+        cb.checked = picked.has(e.id);
+        // Only the totals change, so the table is left alone to keep scroll position.
+        cb.addEventListener('change', () => {
+            if (cb.checked) picked.add(e.id); else picked.delete(e.id);
+            tr.className = cb.checked ? 'cl-picked' : '';
+            refreshTotals();
+        });
+        const tr = el('tr', { class: cb.checked ? 'cl-picked' : '' },
+            el('td', { class: 'cl-pick' }, cb),
             el('td', { text: time }),
             el('td', {}, w ? document.createTextNode(w.name) : el('span', { class: 'cl-warn-text', text: e.host ? maskHost(e.host) : e.src }), addBtn),
             el('td', {}, document.createTextNode(originText(e, { ...S, showModel: false }) || '—'), ' ',
@@ -1922,11 +2390,12 @@ function renderLog() {
                 })),
             el('td', { text: e.model, class: 'cl-model' }),
             el('td', { text: tok }),
-            el('td', { text: entryCostText(e, w) })));
+            el('td', { text: entryCostText(e, w) }));
+        tbl.append(tr);
     }
-    box.append(tbl, el('div', { class: 'cl-note', text: '≈ 표시는 응답에 토큰 수가 없어서 실리태번 토큰 계산기로 추정한 값이에요 (생각 토큰은 빠져요).' }));
+    const more = inRange.length > rows.length ? ` (${inRange.length}건 중 최근 ${rows.length}건만 표시)` : '';
+    box.append(tbl, el('div', { class: 'cl-note', text: `≈ 표시는 응답에 토큰 수가 없어서 실리태번 토큰 계산기로 추정한 값이에요 (생각 토큰은 빠져요).${more}` }));
 }
-
 function renderPrices() {
     const box = document.getElementById('cl_prices');
     if (!box) return;
@@ -1979,6 +2448,7 @@ function renderAll() {
         renderLog();
         renderWho();
         renderDiag();
+        renderBudget();
     } catch (e) {
         console.warn('[credit-ledger] render failed', e);
     }
@@ -1999,7 +2469,11 @@ function mountPanel() {
             el('div', { class: 'fa-solid fa-wallet extensionsMenuExtensionButton' }),
             document.createTextNode('크레딧 장부'));
         item.addEventListener('click', () => openWindow());
-        menu.append(item);
+        const est = el('div', { id: 'cl_menu_estimate', class: 'list-group-item flex-container flexGap5', title: '지금 보내면 얼마쯤 드는지 계산 (AI 호출 없음)' },
+            el('div', { class: 'fa-solid fa-calculator extensionsMenuExtensionButton' }),
+            document.createTextNode('보내기 전 비용 계산'));
+        est.addEventListener('click', () => estimateNext());
+        menu.append(item, est);
     }
 }
 
