@@ -133,3 +133,7 @@
 .popup.cl-themed select option { background: var(--cl-t-bg); color: var(--cl-t-fg); }
 .cl-root .cl-color { display: inline-flex; align-items: center; gap: 4px; font-size: 0.85em; cursor: pointer; }
 .cl-root .cl-color input { width: 28px; height: 22px; padding: 0; border: 1px solid var(--cl-line); border-radius: 4px; background: none; cursor: pointer; }
+.cl-root .cl-cache-btn { background: none; border: none; padding: 0; margin: 0; font: inherit; color: inherit; cursor: pointer; }
+.cl-root .cl-cache-miss.cl-cache-btn { color: var(--cl-accent); text-decoration: underline; text-underline-offset: 2px; }
+.cl-help .cl-diff { font-size: 0.88em; border: 1px solid var(--cl-line); border-radius: 8px; padding: 8px 10px; margin: 6px 0; word-break: break-all; }
+.cl-help .cl-diff > div { margin: 3px 0; }

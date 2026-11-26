@@ -1082,6 +1082,145 @@ function renderBudget() {
         el('div', { class: 'cl-note', text: '모든 지갑 합계예요. 다른 화폐 지갑은 환율로 바꿔서 더해요.' })));
 }
 
+// ------------------------------------------------------------ cache diagnosis
+// A provider cache hit needs the start of the prompt to match a recent request
+// exactly. We keep the last few prompts in memory only (never saved) and find
+// where the new one first parts ways with the closest of them.
+
+const CACHE_KEEP = 12;
+const CACHE_WINDOW_MS = 60 * 60 * 1000;
+const CACHE_MIN_TOK = 2048;
+const recentPrompts = [];
+const cacheSnips = new Map(); // entry id → text around the split (memory only)
+
+function canonPrompt(messages) {
+    let text = '';
+    const starts = [];
+    const roles = [];
+    for (const m of messages) {
+        starts.push(text.length);
+        roles.push(String(m?.role || ''));
+        const c = typeof m?.content === 'string' ? m.content
+            : Array.isArray(m?.content) ? m.content.map(x => x?.text ?? (x?.type ? `[${x.type}]` : '')).join('\n') : '';
+        text += `\u0001${m?.role || ''}\u0002${m?.name || ''}\u0003${c}`;
+    }
+    return { text, starts, roles };
+}
+
+function commonPrefix(a, b) {
+    const n = Math.min(a.length, b.length);
+    let i = 0;
+    // Compare in chunks first; long prompts are mostly identical.
+    while (i + 256 <= n && a.substr(i, 256) === b.substr(i, 256)) i += 256;
+    while (i < n && a.charCodeAt(i) === b.charCodeAt(i)) i++;
+    return i;
+}
+
+const plainSnip = (t) => t
+    .replace(/\u0001([^\u0002\u0003]*)\u0002[^\u0003]*\u0003/g, ' ⟨$1⟩ ')
+    .replace(/[\u0001-\u0003]/g, '')
+    .replace(/\s+/g, ' ').trim();
+
+function diagnosePrefix(meta) {
+    if (!Array.isArray(meta.messages) || !meta.messages.length) return null;
+    const cur = canonPrompt(meta.messages);
+    const key = `${meta.source}|${meta.host}|${meta.keyId}|${meta.model}`;
+    const now = Date.now();
+    while (recentPrompts.length && now - recentPrompts[0].t > CACHE_WINDOW_MS) recentPrompts.shift();
+    let best = null;
+    let bestLen = -1;
+    for (const r of recentPrompts) {
+        if (r.key !== key) continue;
+        const l = commonPrefix(r.text, cur.text);
+        if (l > bestLen || (l === bestLen && r.t > best.t)) { best = r; bestLen = l; }
+    }
+    recentPrompts.push({ key, text: cur.text, t: now, gen: meta.origin?.gen || '', ext: meta.origin?.ext || '' });
+    if (recentPrompts.length > CACHE_KEEP) recentPrompts.shift();
+    if (!best) return { cd: { first: 1, tot: cur.text.length, n: cur.starts.length } };
+    let mi = cur.starts.length - 1;
+    while (mi > 0 && cur.starts[mi] > bestLen) mi--;
+    const cd = {
+        pre: bestLen, tot: cur.text.length, n: cur.starts.length,
+        mi, role: cur.roles[mi] || '',
+        gap: Math.round((now - best.t) / 1000),
+        pg: best.gen, px: best.ext,
+    };
+    const snip = bestLen < cur.text.length && bestLen < best.text.length ? {
+        before: plainSnip(cur.text.slice(Math.max(0, bestLen - 60), bestLen)),
+        was: plainSnip(best.text.slice(bestLen, bestLen + 100)),
+        now: plainSnip(cur.text.slice(bestLen, bestLen + 100)),
+    } : null;
+    return { cd, snip };
+}
+
+function cacheDiagnosis(e) {
+    const d = e.cd;
+    if (!d) return { head: '진단 정보가 없어요', lines: ['1.1.6 업데이트 전에 쌓인 기록이라 비교할 정보가 없어요.'] };
+    const perChar = d.tot ? (e.in || 0) / d.tot : 0;
+    const tok = (c) => Math.round(c * perChar);
+    const hit = e.cached > 0;
+    const lines = [];
+    if (d.first) {
+        return {
+            head: '비교할 앞 요청이 없었어요',
+            lines: [
+                '최근 1시간 안에 같은 모델·같은 키로 보낸 요청이 (이 브라우저 탭에서는) 없었어요. 첫 요청은 캐시를 만들기만 하고, 적중은 다음 요청부터예요.',
+                '페이지를 새로고침하면 비교 기록이 비워져서, 새로고침 직후 첫 요청도 여기에 해당해요.',
+            ],
+        };
+    }
+    let head;
+    const preTok = tok(d.pre);
+    const pct = d.tot ? Math.round(d.pre / d.tot * 100) : 0;
+    const prevLabel = extLabel({ ext: d.px, gen: d.pg }) + (!d.px && GEN_TYPES[d.pg] ? ` · ${GEN_TYPES[d.pg]}` : '');
+    lines.push(`가장 비슷했던 앞 요청: ${prevLabel} · ${d.gap < 120 ? `${d.gap}초` : `${Math.round(d.gap / 60)}분`} 전`);
+    lines.push(`그 요청과 똑같은 앞부분: 약 ${fmtTok(preTok)} 토큰 (이번 프롬프트의 ${pct}%)`);
+    if (hit) {
+        head = `캐시가 걸렸어요 (입력의 ${Math.round(Math.min(e.cached, e.in) / e.in * 100)}%)`;
+        if (e.cached < preTok * 0.7) lines.push('같은 앞부분보다 캐시된 양이 적어요. 버텍스는 앞부분을 일정 크기 단위로 끊어서 저장해서 조금 덜 잡히는 게 보통이에요.');
+    } else if (preTok < CACHE_MIN_TOK && pct < 60) {
+        head = '앞부분이 일찍 달라졌어요';
+        lines.push(`${d.mi + 1}번째 메시지(${d.role || '?'})부터 내용이 달라져서, 그 뒤는 전부 새로 읽어야 했어요.`);
+    } else if (preTok < CACHE_MIN_TOK) {
+        head = '프롬프트가 짧아요';
+        lines.push(`캐시는 같은 앞부분이 일정 길이(모델마다 대략 1천~4천 토큰) 이상일 때만 걸려요. 이번엔 약 ${fmtTok(preTok)} 토큰이라 모자랐을 수 있어요.`);
+    } else if (d.gap > 600) {
+        head = '앞 요청과 시간 차이가 있었어요';
+        lines.push(`앞부분은 같았지만 ${Math.round(d.gap / 60)}분이 지나서, 버텍스가 이미 잊었을 수 있어요.`);
+    } else {
+        head = '앞부분은 같았는데 버텍스가 캐시를 쓰지 않았어요';
+        lines.push('보내는 쪽에는 문제가 없어요. 암묵적 캐싱은 버텍스가 "될 때 해주는" 방식이라, 조건이 맞아도 가끔 안 걸려요.');
+        lines.push('계속 이렇다면: 연결 지역(region)이 global이면 요청이 매번 다른 서버로 가서 덜 걸릴 수 있어요. 특정 지역(예: us-central1)으로 바꿔서 비교해보세요.');
+    }
+    if (!hit && ['swipe', 'regenerate'].includes(e.gen) && pct < 90) {
+        lines.push('리롤은 원래 프롬프트가 거의 그대로라 캐시가 가장 잘 걸리는 경우예요. 그런데도 앞쪽이 달라졌다면 {{random}}·{{time}} 같은 매크로, 확률이 100%가 아닌 로어북 항목, 매번 다른 내용을 끼워 넣는 확장을 의심해보세요.');
+    }
+    return { head, lines, snip: cacheSnips.get(e.id), splitAt: !hit && pct < 90 ? `${d.mi + 1}번째 메시지 (${d.role || '?'}) — 전체 ${d.n}개 중` : '' };
+}
+
+function showCacheDiagnosis(e) {
+    const r = cacheDiagnosis(e);
+    const box = el('div', { class: 'cl-root cl-help' },
+        el('h4', { text: r.head }),
+        el('ul', {}, ...r.lines.map(t => el('li', { text: t }))));
+    if (r.splitAt) {
+        box.append(el('h4', { text: '어디서 달라졌나' }), el('div', { class: 'cl-note', text: r.splitAt }));
+        if (r.snip) {
+            box.append(
+                el('div', { class: 'cl-diff' },
+                    el('div', {}, el('b', { text: '같은 부분 끝: ' }), `…${r.snip.before}`),
+                    el('div', {}, el('b', { text: '앞 요청: ' }), `${r.snip.was}…`),
+                    el('div', {}, el('b', { text: '이번 요청: ' }), `${r.snip.now}…`)),
+                el('div', { class: 'cl-note', text: '⟨system⟩·⟨user⟩·⟨assistant⟩는 새 메시지가 시작되는 곳이에요. 이 글은 브라우저 메모리에만 있고 저장되지 않아요.' }));
+        } else {
+            box.append(el('div', { class: 'cl-note', text: '달라진 글은 새로고침하면 지워져서 지금은 보여줄 수 없어요.' }));
+        }
+    }
+    box.append(el('div', { class: 'cl-row' }, helpBtn('캐시 설명 보기')));
+    const { Popup, POPUP_TYPE } = ctx();
+    themedPopup(new Popup(box, POPUP_TYPE.TEXT, '', { okButton: '닫기', allowVerticalScrolling: true, leftAlign: true })).show();
+}
+
 function record(meta, usage, estimated) {
     const w = walletFor(meta);
     const lookup = w && TYPES[w.type]?.lookup;
@@ -1107,6 +1246,13 @@ function record(meta, usage, estimated) {
     };
     if (meta.fp) entry.fp = meta.fp;
     if (meta.direct) entry.direct = true;
+    try {
+        const dg = diagnosePrefix(meta);
+        if (dg) {
+            entry.cd = dg.cd;
+            if (dg.snip) { cacheSnips.set(entry.id, dg.snip); if (cacheSnips.size > 60) cacheSnips.delete(cacheSnips.keys().next().value); }
+        }
+    } catch { /* diagnosis is optional */ }
     if (!entry.ext && meta.fp) {
         const rule = findRule(entry.gen, entry.model, meta.fp);
         if (rule) { entry.ext = rule.ext; entry.extBy = 'rule'; rule.hits = (rule.hits || 0) + 1; rule.last = now; }
@@ -2364,9 +2510,9 @@ function cacheBadge(e) {
     if (e.est) return el('span', { class: 'cl-cache cl-cache-unk', text: '?', title: '응답에 토큰 정보가 없어서 캐시가 걸렸는지 알 수 없어요 (스트리밍을 끄고 보낸 요청 등)' });
     if (e.cached > 0) {
         const pct = e.in ? Math.round(Math.min(e.cached, e.in) / e.in * 100) : 0;
-        return el('span', { class: 'cl-cache cl-cache-hit', text: `🟢 ${pct}%`, title: `입력 ${fmtTok(e.in)} 중 ${fmtTok(e.cached)}가 캐시에서 읽혔어요` });
+        return el('button', { type: 'button', class: 'cl-cache cl-cache-hit cl-cache-btn', text: `🟢 ${pct}%`, title: `입력 ${fmtTok(e.in)} 중 ${fmtTok(e.cached)}가 캐시에서 읽혔어요. 눌러서 자세히 보기`, onclick: () => showCacheDiagnosis(e) });
     }
-    return el('span', { class: 'cl-cache cl-cache-miss', text: '⚪', title: '캐시가 걸리지 않았어요' });
+    return el('button', { type: 'button', class: 'cl-cache cl-cache-miss cl-cache-btn', text: '⚪ 왜?', title: '캐시가 왜 안 걸렸는지 보기', onclick: () => showCacheDiagnosis(e) });
 }
 
 /** This month's spend grouped by where it came from (or by chat). */
