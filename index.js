@@ -1624,12 +1624,12 @@ function renderDiag() {
 
 function cacheLine(w, unit) {
     const c = cacheStats(periodEntries().filter(e => e.w === w.id));
-    if (!c.n) return c.unknown ? el('div', { class: 'cl-sub cl-period-spend', text: `캐시 적중 알 수 없음 (${c.unknown}회 모두 추정 기록)` }) : null;
+    if (!c.n) return c.unknown ? el('div', { class: 'cl-sub cl-cache-sum' }, `캐시 적중 알 수 없음 (${c.unknown}회 모두 추정 기록) `, helpBtn()) : null;
     const parts = [`캐시 적중 ${Math.round(c.rate * 100)}% (${c.hits}/${c.n}회)`];
     if (c.saved > 0) parts.push(`캐시로 아낀 금액 ${fmt(c.saved, unit)}`);
     else if (!c.hits) parts.push('이 기간엔 캐시가 안 걸렸어요');
     if (c.unknown) parts.push(`알 수 없음 ${c.unknown}회`);
-    return el('div', { class: `cl-sub cl-period-spend${c.hits ? ' cl-cache-line' : ''}`, text: parts.join(' · '), title: '적중률은 입력 토큰 중 캐시로 읽힌 비율이에요. 추정(≈) 기록은 캐시 여부를 몰라서 빼고 계산해요.' });
+    return el('div', { class: `cl-sub cl-cache-sum${c.hits ? ' cl-cache-line' : ''}` }, parts.join(' · ') + ' ', helpBtn());
 }
 
 function renderWallets() {
@@ -1664,7 +1664,7 @@ function renderWallets() {
             el('div', { class: 'cl-big', text: remText }),
             sub.length ? el('div', { class: 'cl-sub', text: sub.join(' · ') }) : null,
             el('div', { class: 'cl-sub', text: `오늘 ${fmt(st.today, unit)} · 이번 달 ${fmt(st.month, unit)}` }),
-            el('div', { class: 'cl-sub cl-period-spend', text: `${periodLabel()} 사용 ${fmt(periodSpend(w), unit)}` }),
+            period === 'today' || period === 'month' ? null : el('div', { class: 'cl-sub cl-period-spend', text: `${periodLabel()} 사용 ${fmt(periodSpend(w), unit)}` }),
             cacheLine(w, unit),
             w.lastError ? el('div', { class: 'cl-sub cl-warn-text', text: `⚠️ ${w.lastError}` }) : null,
             el('div', { class: 'cl-row' },
@@ -2254,6 +2254,42 @@ function cacheStats(entries) {
     return { n: exact.length, unknown: entries.length - exact.length, hits, rate: inTok ? cachedTok / inTok : 0, saved };
 }
 
+const CACHE_HELP = [
+    ['캐시가 뭐예요?', [
+        '매번 보내는 프롬프트의 앞부분(시스템 프롬프트, 캐릭터 카드, 앞선 대화)은 거의 그대로예요. 버텍스·제미니는 최근에 받은 앞부분을 잠깐 기억해 두었다가, 같은 앞부분이 또 오면 기억해 둔 걸 다시 써요. 이걸 "캐시 적중"이라고 해요.',
+        '캐시로 읽힌 입력은 보통 입력 단가의 10%만 내요. 단가표의 "캐시 $" 칸이 그 가격이에요.',
+        '버텍스는 따로 설정하지 않아도 알아서 캐시해 줘요(암묵적 캐싱). 대신 걸린다는 보장은 없어요. DeepSeek도 비슷하게 자동으로 캐시돼요.',
+    ]],
+    ['언제 걸려요?', [
+        '앞부분이 이전 요청과 글자 하나까지 똑같아야 해요. 처음으로 달라진 곳부터 뒤쪽은 전부 새로 읽어요.',
+        '프롬프트가 너무 짧으면 안 걸려요. 모델마다 최소 길이가 있어요 (대략 1천~4천 토큰).',
+        '시간이 지나면 잊어버려요. 정확한 시간은 공개되지 않았지만 보통 몇 분 정도예요. 오래 쉬었다가 보내면 안 걸릴 수 있어요.',
+        '같은 모델로 보내야 해요.',
+    ]],
+    ['계속 ⚪만 나온다면', [
+        '프롬프트 앞쪽에 매번 바뀌는 게 들어가 있을 수 있어요. 예: {{time}}·{{date}}·{{random}} 매크로, 앞쪽에 끼워지는 로어북·요약·작가 노트.',
+        '컨텍스트가 꽉 차서 오래된 메시지가 하나씩 밀려나면, 그때마다 앞부분이 바뀌어서 캐시가 깨져요.',
+        '모델이나 프리셋을 바꾼 직후의 첫 요청은 캐시가 안 걸려요.',
+    ]],
+    ['표시 읽는 법', [
+        '🟢 72% — 입력 중 72%를 캐시로 읽었어요.',
+        '⚪ — 캐시가 안 걸렸어요.',
+        '? — 알 수 없어요. 응답에 토큰 정보가 없어서 추정한 기록이에요. 버텍스·제미니는 스트리밍을 끄고 보내면 실리태번이 이 정보를 버려서, 스트리밍을 켠 요청만 캐시를 확인할 수 있어요.',
+        '지갑 카드의 "캐시 적중 %"는 고른 기간의 입력 토큰 중 캐시로 읽힌 비율이에요. "아낀 금액"은 캐시가 없었다면 더 냈을 금액이에요. ? 기록은 둘 다 빼고 계산해요.',
+    ]],
+];
+
+function showCacheHelp() {
+    const box = el('div', { class: 'cl-root cl-help' });
+    for (const [title, lines] of CACHE_HELP) {
+        box.append(el('h4', { text: title }), el('ul', {}, ...lines.map(t => el('li', { text: t }))));
+    }
+    const { Popup, POPUP_TYPE } = ctx();
+    new Popup(box, POPUP_TYPE.TEXT, '', { okButton: '닫기', allowVerticalScrolling: true, leftAlign: true }).show();
+}
+
+const helpBtn = (text = '캐시란?') => el('button', { class: 'cl-help-btn', type: 'button', text, title: '캐시 설명 보기', onclick: (ev) => { ev.stopPropagation(); showCacheHelp(); } });
+
 function cacheBadge(e) {
     if (e.est) return el('span', { class: 'cl-cache cl-cache-unk', text: '?', title: '응답에 토큰 정보가 없어서 캐시가 걸렸는지 알 수 없어요 (스트리밍을 끄고 보낸 요청 등)' });
     if (e.cached > 0) {
@@ -2403,7 +2439,9 @@ function renderLog() {
     const today = dayKey();
     const tbl = el('table', { class: 'cl-table' },
         el('tr', {}, el('th', { class: 'cl-pick' }, allBox),
-            ...['시간', '지갑', '사용처', '모델', '입력/출력', '캐시', '비용'].map(h => el('th', { text: h }))));
+            ...['시간', '지갑', '사용처', '모델', '입력/출력'].map(h => el('th', { text: h })),
+            el('th', {}, '캐시 ', helpBtn('?')),
+            el('th', { text: '비용' })));
     for (const e of rows) {
         const w = S.wallets.find(x => x.id === e.w);
         const tok = `${fmtTok(e.in)} / ${fmtTok(e.out + (e.think || 0))}${e.think ? ` (생각 ${fmtTok(e.think)})` : ''}${e.est ? ' ≈' : ''}`;
@@ -2423,7 +2461,7 @@ function renderLog() {
         });
         const tr = el('tr', { class: cb.checked ? 'cl-picked' : '' },
             el('td', { class: 'cl-pick' }, cb),
-            el('td', { text: time }),
+            el('td', { text: time, class: 'cl-nowrap' }),
             el('td', {}, w ? document.createTextNode(w.name) : el('span', { class: 'cl-warn-text', text: e.host ? maskHost(e.host) : e.src }), addBtn),
             el('td', {}, document.createTextNode(originText(e, { ...S, showModel: false }) || '—'), ' ',
                 el('button', {
@@ -2439,9 +2477,9 @@ function renderLog() {
         tbl.append(tr);
     }
     const more = inRange.length > rows.length ? ` (${inRange.length}건 중 최근 ${rows.length}건만 표시)` : '';
-    box.append(tbl,
+    box.append(el('div', { class: 'cl-scroll' }, tbl),
         el('div', { class: 'cl-note', text: `≈ 표시는 응답에 토큰 수가 없어서 실리태번 토큰 계산기로 추정한 값이에요 (생각 토큰은 빠져요).${more}` }),
-        el('div', { class: 'cl-note', text: '캐시: 🟢 = 입력 중 캐시로 읽힌 비율, ⚪ = 안 걸림, ? = 알 수 없음. 버텍스·제미니는 스트리밍을 켜고 보낸 요청만 캐시 정보가 와요.' }));
+        el('div', { class: 'cl-note' }, '캐시: 🟢 = 입력 중 캐시로 읽힌 비율, ⚪ = 안 걸림, ? = 알 수 없음. ', helpBtn('캐시 설명 보기')));
 }
 function renderPrices() {
     const box = document.getElementById('cl_prices');
