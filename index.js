@@ -1087,7 +1087,7 @@ function renderBudget() {
 // exactly. We keep the last few prompts in memory only (never saved) and find
 // where the new one first parts ways with the closest of them.
 
-const CACHE_KEEP = 12;
+const CACHE_KEEP = 40;
 const CACHE_WINDOW_MS = 60 * 60 * 1000;
 const CACHE_MIN_TOK = 2048;
 const recentPrompts = [];
@@ -1127,14 +1127,18 @@ function diagnosePrefix(meta) {
     const key = `${meta.source}|${meta.host}|${meta.keyId}|${meta.model}`;
     const now = Date.now();
     while (recentPrompts.length && now - recentPrompts[0].t > CACHE_WINDOW_MS) recentPrompts.shift();
+    // Requests whose first message is the same are "the same kind" (same extension task, or the main chat).
+    const kind = meta.fp?.h || String(cur.text.length && cur.text.slice(0, 300));
     let best = null;
     let bestLen = -1;
+    let sameKind = null;
     for (const r of recentPrompts) {
         if (r.key !== key) continue;
         const l = commonPrefix(r.text, cur.text);
         if (l > bestLen || (l === bestLen && r.t > best.t)) { best = r; bestLen = l; }
+        if (r.kind === kind && (!sameKind || r.t > sameKind.t)) sameKind = r;
     }
-    recentPrompts.push({ key, text: cur.text, t: now, gen: meta.origin?.gen || '', ext: meta.origin?.ext || '' });
+    recentPrompts.push({ key, kind, text: cur.text, t: now, gen: meta.origin?.gen || '', ext: meta.origin?.ext || '' });
     if (recentPrompts.length > CACHE_KEEP) recentPrompts.shift();
     if (!best) return { cd: { first: 1, tot: cur.text.length, n: cur.starts.length } };
     let mi = cur.starts.length - 1;
@@ -1144,7 +1148,12 @@ function diagnosePrefix(meta) {
         mi, role: cur.roles[mi] || '',
         gap: Math.round((now - best.t) / 1000),
         pg: best.gen, px: best.ext,
+        dup: bestLen === cur.text.length && bestLen === best.text.length ? 1 : 0,
+        other: best.kind !== kind ? 1 : 0,
     };
+    if (sameKind && sameKind !== best) {
+        cd.k = { pre: commonPrefix(sameKind.text, cur.text), gap: Math.round((now - sameKind.t) / 1000) };
+    } else if (!sameKind) cd.k = 0;
     const snip = bestLen < cur.text.length && bestLen < best.text.length ? {
         before: plainSnip(cur.text.slice(Math.max(0, bestLen - 60), bestLen)),
         was: plainSnip(best.text.slice(bestLen, bestLen + 100)),
@@ -1175,12 +1184,25 @@ function cacheDiagnosis(e) {
     const prevLabel = extLabel({ ext: d.px, gen: d.pg }) + (!d.px && GEN_TYPES[d.pg] ? ` · ${GEN_TYPES[d.pg]}` : '');
     lines.push(`가장 비슷했던 앞 요청: ${prevLabel} · ${d.gap < 120 ? `${d.gap}초` : `${Math.round(d.gap / 60)}분`} 전`);
     lines.push(`그 요청과 똑같은 앞부분: 약 ${fmtTok(preTok)} 토큰 (이번 프롬프트의 ${pct}%)`);
+    const ago = (g) => g < 120 ? `${g}초` : `${Math.round(g / 60)}분`;
     if (hit) {
         head = `캐시가 걸렸어요 (입력의 ${Math.round(Math.min(e.cached, e.in) / e.in * 100)}%)`;
         if (e.cached < preTok * 0.7) lines.push('같은 앞부분보다 캐시된 양이 적어요. 버텍스는 앞부분을 일정 크기 단위로 끊어서 저장해서 조금 덜 잡히는 게 보통이에요.');
+    } else if (d.dup && d.gap <= 120) {
+        head = '똑같은 요청을 연달아 보냈어요';
+        lines.push(`${ago(d.gap)} 전 요청과 내용이 글자 하나까지 같아요. 같은 요청에 두 번 돈을 낸 거예요.`);
+        lines.push('확장이 같은 요청을 두 번 보내거나(버튼 두 번 누름, 자동 재시도, 두 확장이 같은 일을 함) 실패한 요청을 다시 보낸 경우일 수 있어요. 앞 요청 직후라 캐시도 못 썼을 거예요.');
+    } else if (pct >= 90 && d.gap <= 20) {
+        head = '앞 요청과 거의 동시에 보냈어요';
+        lines.push(`앞부분은 같았지만 앞 요청이 겨우 ${d.gap}초 전이었어요. 버텍스는 요청을 다 처리한 뒤에야 캐시를 만들어서, 앞 요청이 끝나기 전이나 직후에 보낸 요청은 캐시를 못 써요.`);
+        lines.push('채팅을 보내자마자 확장이 같은 내용으로 따로 요청을 보내는 경우에 자주 생겨요.');
     } else if (preTok < CACHE_MIN_TOK && pct < 60) {
         head = '앞부분이 일찍 달라졌어요';
         lines.push(`${d.mi + 1}번째 메시지(${d.role || '?'})부터 내용이 달라져서, 그 뒤는 전부 새로 읽어야 했어요.`);
+        if (d.other) {
+            lines.push('가장 비슷한 요청조차 첫 메시지(지시문)부터 달라요. 즉 최근 요청들과는 하는 일이 다른 요청이라 서로 캐시를 나눠 쓸 수 없어요. 확장 요청은 보통 "확장 지시문 + 채팅 내용" 순서라서 본 채팅과도 캐시가 공유되지 않아요.');
+            if (d.k === 0) lines.push('최근 1시간 안에 같은 종류의 요청이 없었어요. 이 요청은 매번 처음부터 전부 읽고 있어요.');
+        }
     } else if (preTok < CACHE_MIN_TOK) {
         head = '프롬프트가 짧아요';
         lines.push(`캐시는 같은 앞부분이 일정 길이(모델마다 대략 1천~4천 토큰) 이상일 때만 걸려요. 이번엔 약 ${fmtTok(preTok)} 토큰이라 모자랐을 수 있어요.`);
@@ -1190,7 +1212,11 @@ function cacheDiagnosis(e) {
     } else {
         head = '앞부분은 같았는데 버텍스가 캐시를 쓰지 않았어요';
         lines.push('보내는 쪽에는 문제가 없어요. 암묵적 캐싱은 버텍스가 "될 때 해주는" 방식이라, 조건이 맞아도 가끔 안 걸려요.');
-        lines.push('계속 이렇다면: 연결 지역(region)이 global이면 요청이 매번 다른 서버로 가서 덜 걸릴 수 있어요. 특정 지역(예: us-central1)으로 바꿔서 비교해보세요.');
+        if (d.gap > 20) lines.push('계속 이렇다면: 연결 지역(region)이 global이면 요청이 매번 다른 서버로 가서 덜 걸릴 수 있어요. 특정 지역(예: us-central1)으로 바꿔서 비교해보세요.');
+    }
+    if (!hit && d.k && d.tot) {
+        const kp = Math.round(d.k.pre / d.tot * 100);
+        lines.push(`같은 종류(첫 메시지가 같은) 직전 요청은 ${ago(d.k.gap)} 전이었고, 그것과는 ${kp}% 같았어요.`);
     }
     if (!hit && ['swipe', 'regenerate'].includes(e.gen) && pct < 90) {
         lines.push('리롤은 원래 프롬프트가 거의 그대로라 캐시가 가장 잘 걸리는 경우예요. 그런데도 앞쪽이 달라졌다면 {{random}}·{{time}} 같은 매크로, 확률이 100%가 아닌 로어북 항목, 매번 다른 내용을 끼워 넣는 확장을 의심해보세요.');
@@ -1907,28 +1933,91 @@ function resetBase(w, amount, at = Date.now()) {
     w.estApprox = 0;
 }
 
-async function calibrate(w) {
-    const { Popup } = ctx();
+/** Start of the current Google billing day (US Pacific midnight), as a local timestamp. */
+function billingDayStart(now = Date.now()) {
+    try {
+        const f = new Intl.DateTimeFormat('en-US', { timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
+        const p = Object.fromEntries(f.formatToParts(new Date(now)).map(x => [x.type, Number(x.value)]));
+        const ptAsUtc = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second);
+        const offset = Math.round((ptAsUtc - now) / 60000) * 60000;
+        return Date.UTC(p.year, p.month - 1, p.day) - offset;
+    } catch {
+        const d = new Date(now); d.setHours(0, 0, 0, 0); return d.getTime();
+    }
+}
+
+const toLocalInput = (t) => {
+    const d = new Date(t - new Date(t).getTimezoneOffset() * 60000);
+    return d.toISOString().slice(0, 16);
+};
+const fmtWhen = (t) => new Date(t).toLocaleString([], { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+
+/** Ledger spend on this wallet after `at` (exclusive), from the kept entries. */
+function spendAfter(w, at) {
+    const rate = rateOf(w);
+    const r = { raw: 0, adj: 0, calls: 0, approx: 0 };
+    for (const e of S.entries) {
+        if (e.w !== w.id || e.t <= at || !Number.isFinite(e.cost) || !Number.isFinite(e.tokenCost)) continue;
+        r.raw += e.tokenCost * rate;
+        r.adj += e.cost;
+        r.calls++;
+        if (e.est) r.approx++;
+    }
+    // Entries are capped; if the oldest kept one is newer than `at`, some may be gone.
+    r.complete = S.entries.length < MAX_ENTRIES || !S.entries.length || S.entries[0].t <= at;
+    return r;
+}
+
+async function askBalance(w) {
+    const { Popup, POPUP_TYPE } = ctx();
     const cur = remainingOf(w);
-    const v = await Popup.show.input(`${w.name} 잔액 보정`, '콘솔에서 확인한 실제 남은 금액을 숫자만 입력해주세요.', cur.value !== null ? cur.value.toFixed(2) : '');
-    if (v === null || v === undefined || v === false) return;
-    const n = Number(String(v).replace(/[^0-9.\-]/g, ''));
-    if (!Number.isFinite(n)) { toastr.warning('숫자를 입력해주세요.'); return; }
+    const amount = el('input', { class: 'text_pole', type: 'text', inputmode: 'decimal', value: cur.value !== null ? cur.value.toFixed(2) : '' });
+    const when = el('input', { class: 'text_pole', type: 'datetime-local', value: toLocalInput(Date.now()) });
+    const quick = (label, t) => el('button', { type: 'button', class: 'menu_button cl-mini', text: label, onclick: () => { when.value = toLocalInput(t()); } });
+    const box = el('div', { class: 'cl-root cl-help' },
+        el('h4', { text: `${w.name} 잔액 보정` }),
+        el('label', { class: 'cl-field' }, el('span', { text: '콘솔에서 본 남은 금액' }), amount),
+        el('label', { class: 'cl-field' }, el('span', { text: '이 금액이 언제까지 반영된 숫자인가요?' }), when),
+        el('div', { class: 'cl-row' },
+            quick('지금', () => Date.now()),
+            quick('구글 결제일 오늘 시작', () => billingDayStart()),
+            quick('오늘 0시', () => { const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime(); })),
+        el('div', { class: 'cl-note', text: '구글 콘솔은 사용 금액이 몇 시간~하루 늦게 반영돼요. "지금"으로 넣으면 아직 반영 안 된 사용분이 장부에서 빠지지 않아요. 콘솔의 날짜별 비용에서 마지막으로 다 반영된 날을 보고, 그날이 끝난 시각을 넣으면 가장 정확해요.' }),
+        el('div', { class: 'cl-note', text: '구글 결제의 하루는 미국 태평양 시간 기준이라, 한국 시간으로는 오후 4~5시에 날짜가 바뀌어요. "구글 결제일 오늘 시작"이 그 시각(= 어제 결제일의 끝)이에요.' }));
+    const ok = await themedPopup(new Popup(box, POPUP_TYPE.CONFIRM, '', { okButton: '저장', cancelButton: '취소' })).show();
+    if (!ok) return null;
+    const n = Number(String(amount.value).replace(/[^0-9.\-]/g, ''));
+    if (!String(amount.value).trim() || !Number.isFinite(n)) { toastr.warning('금액을 숫자로 입력해주세요.'); return null; }
+    let at = when.value ? new Date(when.value).getTime() : Date.now();
+    if (!Number.isFinite(at)) at = Date.now();
+    if (at > Date.now() + 60000) { toastr.warning('미래 시각은 넣을 수 없어요.'); return null; }
+    return { n, at: Math.min(at, Date.now()) };
+}
+
+async function calibrate(w) {
+    const input = await askBalance(w);
+    if (!input) return;
+    const { n, at } = input;
     const now = Date.now();
+    const after = spendAfter(w, at);
     let report = null;
     if (w.base && Number.isFinite(w.base.amount)) {
-        const lastUse = Math.max(0, ...S.entries.filter(e => e.w === w.id).map(e => e.t));
+        const lastUse = Math.max(0, ...S.entries.filter(e => e.w === w.id && e.t <= at).map(e => e.t));
         report = {
+            from: w.base.at, to: at,
             actual: w.base.amount - n,
-            raw: w.rawSinceBase || 0,
-            shown: w.spentSinceBase || 0,
-            calls: w.estCalls || 0,
-            approx: w.estApprox || 0,
+            // Accumulators run from the old base to now; drop what came after the new as-of time.
+            raw: Math.max(0, (w.rawSinceBase || 0) - after.raw),
+            shown: Math.max(0, (w.spentSinceBase || 0) - after.adj),
+            calls: Math.max(0, (w.estCalls || 0) - after.calls),
+            approx: Math.max(0, (w.estApprox || 0) - after.approx),
             reason: '',
         };
-        if (report.actual < 0) report.reason = 'topup';
+        if (at <= w.base.at) report.reason = 'order';
+        else if (!after.complete) report.reason = 'gone';
+        else if (report.actual < 0) report.reason = 'topup';
         else if (report.calls < CALIB_MIN_CALLS || report.raw / rateOf(w) < CALIB_MIN_SPEND) report.reason = 'small';
-        else if (now - lastUse < CALIB_RECENT_MS) report.reason = 'recent';
+        else if (now - at < CALIB_RECENT_MS && at - lastUse < CALIB_RECENT_MS) report.reason = 'recent';
         else {
             const measured = report.actual / report.raw;
             report.measured = measured;
@@ -1941,23 +2030,33 @@ async function calibrate(w) {
             }
         }
     }
-    resetBase(w, n, now);
+    resetBase(w, n, at);
+    // Spend the console hasn't seen yet still comes off the balance.
+    w.spentSinceBase = after.adj;
+    w.rawSinceBase = after.raw;
+    w.estCalls = after.calls;
+    w.estApprox = after.approx;
     save();
     renderAll();
-    if (report) showCalibReport(w, report);
+    if (!after.complete) toastr.warning('그 시각 이후 기록 중 오래된 일부가 이미 지워져서, 남은 잔액이 조금 높게 나올 수 있어요.');
+    if (report) showCalibReport(w, report, after);
+    else if (after.calls) toastr.info(`${fmtWhen(at)} 이후 장부에 쌓인 ${after.calls}회(${fmt(after.adj, walletUnit(w))})를 빼고 잔액을 계산해요.`);
 }
 
-function showCalibReport(w, r) {
+function showCalibReport(w, r, after) {
     const unit = walletUnit(w);
     const lines = [
-        `지난 보정 이후 장부 계산: ${fmt(r.shown, unit)} (단가표 그대로면 ${fmt(r.raw, unit)}, ${r.calls}회)`,
+        `비교 기간: ${fmtWhen(r.from)} → ${fmtWhen(r.to)}`,
+        `그 사이 장부 계산: ${fmt(r.shown, unit)} (단가표 그대로면 ${fmt(r.raw, unit)}, ${r.calls}회)`,
         `실제로 줄어든 금액: ${fmt(r.actual, unit)}`,
     ];
     if (r.measured) lines.push(`오차: 단가표 기준 ${r.measured >= 1 ? '+' : ''}${Math.round((r.measured - 1) * 100)}%`);
     const why = {
         topup: '잔액이 오히려 늘었어요. 충전이나 크레딧 추가가 있었던 것 같아서 이번엔 자동 보정하지 않았어요.',
         small: `아직 사용량이 적어서(${CALIB_MIN_CALLS}회 또는 ${fmt(CALIB_MIN_SPEND * rateOf(w), unit)} 미만) 비교하기 일러요. 잔액만 맞춰뒀어요.`,
-        recent: '마지막 사용이 3시간 이내예요. 구글 결제는 몇 시간 늦게 반영돼서 이번엔 자동 보정을 건너뛰고 잔액만 맞췄어요. 다음엔 사용 후 반나절~하루 지나서 보정하면 정확해요.',
+        recent: '기준 시각이 지금이고 그 직전 3시간 안에 사용 기록이 있어요. 구글 결제는 늦게 반영돼서 이번엔 자동 보정을 건너뛰고 잔액만 맞췄어요. 다음엔 기준 시각을 "구글 결제일 오늘 시작"처럼 다 반영된 시각으로 넣어주세요.',
+        order: '기준 시각이 지난번 보정 시각보다 앞이라 비교할 수 없어요. 잔액만 맞췄어요.',
+        gone: '비교 기간의 기록 일부가 이미 지워져서(최근 기록만 보관) 정확히 비교할 수 없어요. 잔액만 맞췄어요.',
         outlier: '차이가 너무 커요(5배 이상). 같은 결제 계정에서 다른 서비스를 썼거나, 단가표에 없는/틀린 모델이 있을 수 있어요. 자동 보정하지 않았어요.',
     }[r.reason];
     if (why) lines.push(`ℹ️ ${why}`);
@@ -1966,6 +2065,7 @@ function showCalibReport(w, r) {
             ? `✅ 자동 보정 적용: 앞으로 계산에 ×${r.newFactor.toFixed(2)}를 곱해요.`
             : `자동 보정이 꺼져 있어요. 켜면 앞으로 ×${r.newFactor.toFixed(2)}를 곱해서 계산해요.`);
     }
+    if (after?.calls) lines.push(`기준 시각 이후 장부에 쌓인 ${after.calls}회(${fmt(after.adj, unit)})는 콘솔에 아직 안 잡힌 걸로 보고 잔액에서 빼요.`);
     if (r.calls && r.approx / r.calls > 0.3) lines.push(`⚠️ 기록의 ${Math.round(r.approx / r.calls * 100)}%가 토큰 수 추정(≈)이에요. 스트리밍을 켜면 훨씬 정확해져요.`);
     const html = `<div class="cl-report">${lines.map(l => `<p>${escapeHtml(l)}</p>`).join('')}</div>`;
     ctx().Popup.show.text(`${w.name} 진단 결과`, html);
