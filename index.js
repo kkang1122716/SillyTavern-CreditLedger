@@ -64,6 +64,8 @@ const defaultSettings = Object.freeze({
     budgetDay: 0,
     budgetMonth: 0,
     budgetFlags: {},
+    theme: 'st',
+    themeCustom: { bg: '#1e2127', fg: '#e4e6ea', accent: '#7aa7d9' },
 });
 
 const ctx = () => SillyTavern.getContext();
@@ -551,7 +553,7 @@ async function labelEntry(e) {
         el('div', { class: e.fp ? 'cl-note' : 'cl-note cl-warn-text', text: e.fp
             ? '같은 확장은 보통 매번 비슷한 지시문을 보내요. 그 지시문의 지문(짧은 해시)만 저장해서 다음부터 알아봐요. 내용 자체는 저장하지 않아요.'
             : '⚠️ 1.0.9 업데이트 전에 쌓인 기록이라 학습에 쓸 지문이 없어요. 이 줄 이름만 바뀌어요. 업데이트 후 새로 생긴 "알 수 없음" 기록에서 고르면 학습까지 돼요.' }));
-    const ok = await new Popup(box, POPUP_TYPE.CONFIRM, '', { okButton: '저장', cancelButton: '취소' }).show();
+    const ok = await themedPopup(new Popup(box, POPUP_TYPE.CONFIRM, '', { okButton: '저장', cancelButton: '취소' })).show();
     if (!ok) return;
     let ext = sel.value;
     if (ext === '@@custom') {
@@ -1000,7 +1002,7 @@ function showEstimate(r) {
         box.append(el('div', { class: 'cl-note', text: `남은 잔액 ${fmt(rem.value, unit)} → 이대로면 약 ${times.toLocaleString()}번 더 보낼 수 있어요.` }));
     }
     const { Popup, POPUP_TYPE } = ctx();
-    new Popup(box, POPUP_TYPE.TEXT, '', { okButton: '닫기', allowVerticalScrolling: true }).show();
+    themedPopup(new Popup(box, POPUP_TYPE.TEXT, '', { okButton: '닫기', allowVerticalScrolling: true })).show();
 }
 
 // ------------------------------------------------------------ budget
@@ -1375,6 +1377,24 @@ const WINDOW_HTML = `
     <label class="checkbox_label"><input class="cl-opt" data-opt="autoCalib" type="checkbox"> 자동 보정</label>
   </div>
   <div class="cl-section">
+    <b>화면 테마</b>
+    <div class="cl-row">
+      <select id="cl_theme" class="text_pole cl-cur">
+        <option value="st">실리태번 테마 따라가기</option>
+        <option value="light">라이트</option>
+        <option value="dark">다크</option>
+        <option value="custom">커스텀</option>
+      </select>
+    </div>
+    <div id="cl_theme_custom" class="cl-row" hidden>
+      <label class="cl-color"><input type="color" data-k="bg"> 바탕</label>
+      <label class="cl-color"><input type="color" data-k="fg"> 글자</label>
+      <label class="cl-color"><input type="color" data-k="accent"> 강조</label>
+      <button type="button" class="menu_button cl-mini cl-theme-reset">되돌리기</button>
+    </div>
+    <div class="cl-note">장부 창과 설명 창에만 적용돼요. 실리태번 다른 화면은 그대로예요.</div>
+  </div>
+  <div class="cl-section">
     <b>예산</b>
     <div class="cl-note">모든 지갑을 합쳐서 80%·100%가 되면 알려줘요. 0이면 꺼져요.</div>
     <div class="cl-row">
@@ -1394,6 +1414,54 @@ try { currentTab = localStorage.getItem('cl_tab') || 'wallets'; } catch { /* */ 
 
 function syncOptions() {
     document.querySelectorAll('.cl-opt').forEach(i => { i.checked = !!S[i.dataset.opt]; });
+}
+
+const THEMES = {
+    light: { bg: '#f7f7f5', fg: '#1f2328', accent: '#2f6fb0' },
+    dark: { bg: '#1b1d21', fg: '#e4e6ea', accent: '#7aa7d9' },
+};
+
+function themeColors() {
+    if (S.theme === 'custom') return { ...THEMES.dark, ...(S.themeCustom || {}) };
+    return THEMES[S.theme] || null;
+}
+
+/** Paint one of our popups; 'st' leaves SillyTavern's own theme alone. */
+function applyTheme(dlg) {
+    if (!dlg) return;
+    const c = themeColors();
+    dlg.classList.toggle('cl-themed', !!c);
+    for (const k of ['bg', 'fg', 'accent']) {
+        if (c) dlg.style.setProperty(`--cl-t-${k}`, c[k]); else dlg.style.removeProperty(`--cl-t-${k}`);
+    }
+}
+
+function themedPopup(popup) {
+    try { applyTheme(popup.dlg); } catch { /* */ }
+    return popup;
+}
+
+function bindTheme(root) {
+    const sel = root.querySelector('#cl_theme');
+    const custom = root.querySelector('#cl_theme_custom');
+    if (!sel) return;
+    const inputs = [...custom.querySelectorAll('input[type=color]')];
+    const sync = () => {
+        sel.value = S.theme || 'st';
+        custom.hidden = S.theme !== 'custom';
+        const c = { ...THEMES.dark, ...(S.themeCustom || {}) };
+        for (const i of inputs) i.value = c[i.dataset.k];
+    };
+    const repaint = () => { save(); sync(); applyTheme(windowPopup?.dlg); };
+    sel.addEventListener('change', () => {
+        // Start the custom palette from whatever was showing, so it's a tweak, not a blank slate.
+        if (sel.value === 'custom' && S.theme !== 'custom' && THEMES[S.theme]) S.themeCustom = { ...THEMES[S.theme] };
+        S.theme = sel.value;
+        repaint();
+    });
+    for (const i of inputs) i.addEventListener('input', () => { S.themeCustom = { ...(S.themeCustom || {}), [i.dataset.k]: i.value }; repaint(); });
+    custom.querySelector('.cl-theme-reset').addEventListener('click', () => { S.themeCustom = { ...THEMES.dark }; repaint(); });
+    sync();
 }
 
 function bindBudget(root) {
@@ -1562,11 +1630,13 @@ function openWindow(tab) {
     });
     bindOptions(root);
     bindBudget(root);
+    bindTheme(root);
     root.querySelectorAll('.cl-estimate-btn').forEach(b => b.addEventListener('click', () => estimateNext()));
     windowPopup = new Popup(root, POPUP_TYPE.DISPLAY, null, {
         wide: true, large: true, allowVerticalScrolling: true, leftAlign: true,
         onClose: () => { windowPopup = null; },
     });
+    applyTheme(windowPopup.dlg);
     windowPopup.show().catch(() => { windowPopup = null; });
     syncOptions();
     selectTab(tab || currentTab);
@@ -2285,7 +2355,7 @@ function showCacheHelp() {
         box.append(el('h4', { text: title }), el('ul', {}, ...lines.map(t => el('li', { text: t }))));
     }
     const { Popup, POPUP_TYPE } = ctx();
-    new Popup(box, POPUP_TYPE.TEXT, '', { okButton: '닫기', allowVerticalScrolling: true, leftAlign: true }).show();
+    themedPopup(new Popup(box, POPUP_TYPE.TEXT, '', { okButton: '닫기', allowVerticalScrolling: true, leftAlign: true })).show();
 }
 
 const helpBtn = (text = '캐시란?') => el('button', { class: 'cl-help-btn', type: 'button', text, title: '캐시 설명 보기', onclick: (ev) => { ev.stopPropagation(); showCacheHelp(); } });

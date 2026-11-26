@@ -112,3 +112,24 @@
 .cl-root .cl-scroll .cl-table { min-width: 640px; }
 .cl-root .cl-table .cl-nowrap { white-space: nowrap; }
 .cl-root .cl-table .cl-model { min-width: 8em; }
+
+/* --- theme (1.1.5): our popups re-map SillyTavern's theme variables --- */
+.popup.cl-themed {
+    --SmartThemeBodyColor: var(--cl-t-fg);
+    --SmartThemeEmColor: var(--cl-t-fg);
+    --SmartThemeUnderlineColor: var(--cl-t-accent);
+    --SmartThemeQuoteColor: var(--cl-t-accent);
+    --SmartThemeBlurTintColor: color-mix(in srgb, var(--cl-t-fg) 7%, var(--cl-t-bg));
+    --SmartThemeBorderColor: color-mix(in srgb, var(--cl-t-fg) 20%, var(--cl-t-bg));
+    --SmartThemeShadowColor: transparent;
+    --black30a: color-mix(in srgb, var(--cl-t-fg) 6%, transparent);
+    --black50a: color-mix(in srgb, var(--cl-t-fg) 10%, transparent);
+    background: var(--cl-t-bg) !important;
+    color: var(--cl-t-fg);
+    backdrop-filter: none;
+}
+.popup.cl-themed, .popup.cl-themed * { text-shadow: none !important; }
+.popup.cl-themed .menu_button { filter: none; }
+.popup.cl-themed select option { background: var(--cl-t-bg); color: var(--cl-t-fg); }
+.cl-root .cl-color { display: inline-flex; align-items: center; gap: 4px; font-size: 0.85em; cursor: pointer; }
+.cl-root .cl-color input { width: 28px; height: 22px; padding: 0; border: 1px solid var(--cl-line); border-radius: 4px; background: none; cursor: pointer; }
