@@ -1622,6 +1622,16 @@ function renderDiag() {
     }
 }
 
+function cacheLine(w, unit) {
+    const c = cacheStats(periodEntries().filter(e => e.w === w.id));
+    if (!c.n) return c.unknown ? el('div', { class: 'cl-sub cl-period-spend', text: `캐시 적중 알 수 없음 (${c.unknown}회 모두 추정 기록)` }) : null;
+    const parts = [`캐시 적중 ${Math.round(c.rate * 100)}% (${c.hits}/${c.n}회)`];
+    if (c.saved > 0) parts.push(`캐시로 아낀 금액 ${fmt(c.saved, unit)}`);
+    else if (!c.hits) parts.push('이 기간엔 캐시가 안 걸렸어요');
+    if (c.unknown) parts.push(`알 수 없음 ${c.unknown}회`);
+    return el('div', { class: `cl-sub cl-period-spend${c.hits ? ' cl-cache-line' : ''}`, text: parts.join(' · '), title: '적중률은 입력 토큰 중 캐시로 읽힌 비율이에요. 추정(≈) 기록은 캐시 여부를 몰라서 빼고 계산해요.' });
+}
+
 function renderWallets() {
     const box = document.getElementById('cl_wallets');
     if (!box) return;
@@ -1655,6 +1665,7 @@ function renderWallets() {
             sub.length ? el('div', { class: 'cl-sub', text: sub.join(' · ') }) : null,
             el('div', { class: 'cl-sub', text: `오늘 ${fmt(st.today, unit)} · 이번 달 ${fmt(st.month, unit)}` }),
             el('div', { class: 'cl-sub cl-period-spend', text: `${periodLabel()} 사용 ${fmt(periodSpend(w), unit)}` }),
+            cacheLine(w, unit),
             w.lastError ? el('div', { class: 'cl-sub cl-warn-text', text: `⚠️ ${w.lastError}` }) : null,
             el('div', { class: 'cl-row' },
                 TYPES[w.type]?.lookup ? el('button', {
@@ -2219,6 +2230,39 @@ function entryValue(e) {
     return null;
 }
 
+/** What this entry would have cost without the cache, minus what it did cost — in the wallet's unit. */
+function cacheSaving(e) {
+    if (!(e.cached > 0) || e.est) return 0;
+    const v = entryValue(e);
+    if (v === null) return 0;
+    const paid = costFromTokens(e.model, e, e.t);
+    const full = costFromTokens(e.model, { ...e, cached: 0 }, e.t);
+    if (!(paid > 0) || !(full > paid)) return 0;
+    return v * (full / paid - 1);
+}
+
+/** Cache hits over exact (non-estimated) entries; estimated ones can't tell either way. */
+function cacheStats(entries) {
+    const exact = entries.filter(e => !e.est && e.in > 0);
+    let inTok = 0, cachedTok = 0, hits = 0, saved = 0;
+    for (const e of exact) {
+        inTok += e.in;
+        cachedTok += Math.min(e.cached || 0, e.in);
+        if (e.cached > 0) hits++;
+        saved += cacheSaving(e);
+    }
+    return { n: exact.length, unknown: entries.length - exact.length, hits, rate: inTok ? cachedTok / inTok : 0, saved };
+}
+
+function cacheBadge(e) {
+    if (e.est) return el('span', { class: 'cl-cache cl-cache-unk', text: '?', title: '응답에 토큰 정보가 없어서 캐시가 걸렸는지 알 수 없어요 (스트리밍을 끄고 보낸 요청 등)' });
+    if (e.cached > 0) {
+        const pct = e.in ? Math.round(Math.min(e.cached, e.in) / e.in * 100) : 0;
+        return el('span', { class: 'cl-cache cl-cache-hit', text: `🟢 ${pct}%`, title: `입력 ${fmtTok(e.in)} 중 ${fmtTok(e.cached)}가 캐시에서 읽혔어요` });
+    }
+    return el('span', { class: 'cl-cache cl-cache-miss', text: '⚪', title: '캐시가 걸리지 않았어요' });
+}
+
 /** This month's spend grouped by where it came from (or by chat). */
 /** Spend over the chosen period, grouped by where it came from (or by chat). */
 function renderOriginSummary() {
@@ -2359,10 +2403,10 @@ function renderLog() {
     const today = dayKey();
     const tbl = el('table', { class: 'cl-table' },
         el('tr', {}, el('th', { class: 'cl-pick' }, allBox),
-            ...['시간', '지갑', '사용처', '모델', '입력/출력', '비용'].map(h => el('th', { text: h }))));
+            ...['시간', '지갑', '사용처', '모델', '입력/출력', '캐시', '비용'].map(h => el('th', { text: h }))));
     for (const e of rows) {
         const w = S.wallets.find(x => x.id === e.w);
-        const tok = `${fmtTok(e.in)} / ${fmtTok(e.out + (e.think || 0))}${e.think ? ` (생각 ${fmtTok(e.think)})` : ''}${e.cached ? ` · 캐시 ${fmtTok(e.cached)}` : ''}${e.est ? ' ≈' : ''}`;
+        const tok = `${fmtTok(e.in)} / ${fmtTok(e.out + (e.think || 0))}${e.think ? ` (생각 ${fmtTok(e.think)})` : ''}${e.est ? ' ≈' : ''}`;
         const addBtn = !w ? el('button', {
             class: 'menu_button cl-mini', text: '지갑 만들기',
             onclick: () => openEditor(null, e.host ? { type: 'newapi', url: `https://${e.host}/v1` } : { type: ({ vertexai: 'vertex', makersuite: 'gemini', deepseek: 'deepseek' })[e.src] || 'manual' }),
@@ -2390,11 +2434,14 @@ function renderLog() {
                 })),
             el('td', { text: e.model, class: 'cl-model' }),
             el('td', { text: tok }),
+            el('td', { class: 'cl-mini-cell' }, cacheBadge(e)),
             el('td', { text: entryCostText(e, w) }));
         tbl.append(tr);
     }
     const more = inRange.length > rows.length ? ` (${inRange.length}건 중 최근 ${rows.length}건만 표시)` : '';
-    box.append(tbl, el('div', { class: 'cl-note', text: `≈ 표시는 응답에 토큰 수가 없어서 실리태번 토큰 계산기로 추정한 값이에요 (생각 토큰은 빠져요).${more}` }));
+    box.append(tbl,
+        el('div', { class: 'cl-note', text: `≈ 표시는 응답에 토큰 수가 없어서 실리태번 토큰 계산기로 추정한 값이에요 (생각 토큰은 빠져요).${more}` }),
+        el('div', { class: 'cl-note', text: '캐시: 🟢 = 입력 중 캐시로 읽힌 비율, ⚪ = 안 걸림, ? = 알 수 없음. 버텍스·제미니는 스트리밍을 켜고 보낸 요청만 캐시 정보가 와요.' }));
 }
 function renderPrices() {
     const box = document.getElementById('cl_prices');

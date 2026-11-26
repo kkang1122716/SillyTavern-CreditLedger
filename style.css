@@ -84,3 +84,6 @@
 .cl-root .cl-bar-fill.cl-bar-warn { background: var(--warning, #e8a33d); }
 .cl-root .cl-bar-fill.cl-bar-over { background: #d9534f; }
 .cl-report .cl-table th { white-space: nowrap; }
+.cl-root .cl-cache { white-space: nowrap; font-size: 0.9em; }
+.cl-root .cl-cache-unk { opacity: 0.6; }
+.cl-root .cl-cache-line { color: #4caf50; opacity: 1; }
